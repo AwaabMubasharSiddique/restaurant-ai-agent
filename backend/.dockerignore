@@ -1,0 +1,25 @@
+# Build context is backend/. Keep the image small and free of secrets.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python caches / envs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Rebuilt at runtime
+rag/faiss_index/
+
+# Tests / dev-only files
+tests/
+pytest.ini
+requirements-dev.txt
