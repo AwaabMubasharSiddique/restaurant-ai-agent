@@ -6,7 +6,7 @@ Flow:  classify_intent -> (router) -> one handler -> persist_log -> END
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import ValidationError
@@ -16,10 +16,10 @@ from agent.prompts import (
     COMPLAINT_SYSTEM_PROMPT,
     FIELD_PROMPTS,
     GREETING_SYSTEM_PROMPT,
-    HANDOFF_MESSAGE,
     HOURS_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     MENU_SYSTEM_PROMPT,
+    OFF_TOPIC_SYSTEM_PROMPT,
     ORDER_SYSTEM_PROMPT,
     RESCHEDULE_SYSTEM_PROMPT,
     RESERVATION_SYSTEM_PROMPT,
@@ -30,10 +30,13 @@ from models.schemas import (
     ConversationLog,
     IntentResult,
     Order,
-    OrderExtraction,
+    OrderItem,
+    OrderTurn,
     Reservation,
     ReservationExtraction,
+    RescheduleResult,
 )
+from menu import format_menu_for_prompt, order_total, price_items
 from rag.retriever import retrieve
 from tools.availability import (
     format_time_12h,
@@ -45,7 +48,7 @@ from tools.availability import (
 )
 from tools.logging_tool import log_conversation
 from tools.order import save_order
-from tools.reservation import save_reservation, update_reservation
+from tools.reservation import cancel_reservation, save_reservation, update_reservation
 
 logger = logging.getLogger("restaurant-ai.agent")
 
@@ -69,6 +72,31 @@ def _format_history(messages: list, limit: int = 12) -> str:
         role = "Customer" if message.type == "human" else "Assistant"
         lines.append(f"{role}: {message.content}")
     return "\n".join(lines)
+
+
+def _bill_lines(priced: list) -> str:
+    """Render priced order items as bullet lines with per-line subtotals."""
+    return "\n".join(
+        f"- {i['quantity']}× {i['name']} — ${i['price'] * i['quantity']:.2f}" for i in priced
+    )
+
+
+def _check_reservation_date(date_str: str) -> str | None:
+    """Return an error message if the date is in the past or beyond the booking
+    window (max_advance_days), else None."""
+    requested = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today = datetime.now().date()
+    if requested < today:
+        return (
+            f"It looks like {date_str} has already passed — "
+            "what upcoming date would you like to come in?"
+        )
+    if requested > today + timedelta(days=settings.max_advance_days):
+        return (
+            f"We take reservations up to about a month ahead. Could you pick a date "
+            f"within the next {settings.max_advance_days} days?"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -161,35 +189,89 @@ def handle_greeting(state: AgentState) -> dict:
 
 
 def handle_order(state: AgentState) -> dict:
-    llm = get_chat_model(temperature=0).with_structured_output(OrderExtraction)
+    pending = state.get("pending_order") or []
+    pending_summary = ", ".join(f"{i['quantity']}× {i['name']}" for i in pending) or "none"
+
+    llm = get_chat_model(temperature=0).with_structured_output(OrderTurn)
     history = _format_history(state.get("messages", []))
-    extraction: OrderExtraction = llm.invoke(
+    turn: OrderTurn = llm.invoke(
         [
-            SystemMessage(content=ORDER_SYSTEM_PROMPT),
+            SystemMessage(
+                content=ORDER_SYSTEM_PROMPT.format(
+                    menu=format_menu_for_prompt(), pending=pending_summary
+                )
+            ),
             HumanMessage(
                 content=f"Conversation:\n{history}\n\nLatest message: {state['user_message']}"
             ),
         ]
     )
 
-    if not extraction.items:
+    # Drop an order in progress.
+    if turn.cancel and pending:
+        return {
+            "response": "No problem — I've cleared that order. Anything else?",
+            "needs_human": False,
+            "pending_order": [],
+        }
+
+    # Place the order the customer is confirming.
+    if turn.confirm and pending:
+        items = [
+            OrderItem(name=i["name"], quantity=i["quantity"], price=i["price"]) for i in pending
+        ]
+        save_order(Order(items=items))
         return {
             "response": (
-                "I'd love to take your order! What would you like? "
-                "Let me know any sizes or special requests too."
+                "Order placed! ✅\n"
+                f"{_bill_lines(pending)}\n"
+                f"Total: ${order_total(pending):.2f}\n"
+                "It's pending — the kitchen will confirm shortly. Payment on pickup."
             ),
+            "needs_human": False,
+            "pending_order": [],
+        }
+
+    # New / updated items -> price them, show the bill, and ask to confirm.
+    if turn.items:
+        priced, unknown = price_items(turn.items)
+        if not priced:
+            missing = ", ".join(unknown) if unknown else "those"
+            return {
+                "response": (
+                    f"I couldn't find {missing} on our menu, so I can't add that. "
+                    "Want me to list what we have?"
+                ),
+                "needs_human": False,
+            }
+        note = (
+            f"\n\n(I couldn't find {', '.join(unknown)} on our menu, so I left those out.)"
+            if unknown
+            else ""
+        )
+        return {
+            "response": (
+                "Here's your order:\n"
+                f"{_bill_lines(priced)}\n"
+                f"Total: ${order_total(priced):.2f}{note}\n\n"
+                "Shall I place it? It'll be pending until the kitchen confirms. (Payment on pickup.)"
+            ),
+            "needs_human": False,
+            "pending_order": priced,
+        }
+
+    # "Confirm" but nothing is in progress.
+    if turn.confirm:
+        return {
+            "response": "I don't have an order started yet — what would you like to order?",
             "needs_human": False,
         }
 
-    order = Order(items=extraction.items, notes=extraction.notes)
-    save_order(order)
-
-    summary = ", ".join(f"{i.quantity}× {i.name}" for i in order.items)
-    note = f" (note: {order.notes})" if order.notes else ""
+    # Nothing actionable yet.
     return {
         "response": (
-            f"Got it — I've started an order for {summary}{note}, marked as "
-            f"pending. The kitchen will confirm it shortly. Anything else?"
+            "I'd love to take your order! What would you like? "
+            "You can ask to see the menu too."
         ),
         "needs_human": False,
     }
@@ -202,7 +284,7 @@ def handle_reservation(state: AgentState) -> dict:
     if state.get("reservation_submitted"):
         record = state.get("reservation_record")
         if record and record.get("id"):
-            return _handle_reschedule(state, record)
+            return _handle_reservation_followup(state, record)
         return {
             "response": (
                 "You already have a pending request — I've flagged your change for "
@@ -268,15 +350,10 @@ def handle_reservation(state: AgentState) -> dict:
             "needs_human": False,
         }
 
-    # Don't accept requests for a date that has already passed.
-    if requested_date < datetime.now().date():
-        return {
-            "response": (
-                f"It looks like {reservation.date} has already passed — "
-                "what upcoming date would you like to come in?"
-            ),
-            "needs_human": False,
-        }
+    # Reject past dates and dates beyond the booking window.
+    date_problem = _check_reservation_date(reservation.date)
+    if date_problem:
+        return {"response": date_problem, "needs_human": False}
 
     # Large groups are coordinated by staff directly (a set menu may apply), so
     # we capture the request as pending and hand it to a person.
@@ -338,26 +415,17 @@ def handle_reservation(state: AgentState) -> dict:
     }
 
 
-def _handle_reschedule(state: AgentState, record: dict) -> dict:
-    """Change an already-submitted reservation in place if still within the edit
-    window; otherwise hand the change to staff. (Reservations only — not orders.)"""
+def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
+    """Change OR cancel an already-submitted reservation in place if still within
+    the edit window; otherwise hand it to staff. (Reservations only — not orders.)"""
     window = settings.reservation_edit_window_minutes
     old_summary = state.get("reservation_summary", "your reservation")
+    within = within_edit_window(record.get("created_at", ""), window)
 
-    if not within_edit_window(record.get("created_at", ""), window):
-        return {
-            "response": (
-                f"Your request for {old_summary} has been in for over {window} minutes, "
-                "so our team will make any changes when they confirm — I've flagged your "
-                "note. What would you like changed?"
-            ),
-            "needs_human": True,
-        }
-
-    llm = get_chat_model(temperature=0).with_structured_output(ReservationExtraction)
+    llm = get_chat_model(temperature=0).with_structured_output(RescheduleResult)
     history = _format_history(state.get("messages", []))
     today = datetime.now().strftime("%A, %Y-%m-%d")
-    extraction: ReservationExtraction = llm.invoke(
+    result: RescheduleResult = llm.invoke(
         [
             SystemMessage(
                 content=RESCHEDULE_SYSTEM_PROMPT.format(
@@ -375,9 +443,53 @@ def _handle_reschedule(state: AgentState, record: dict) -> dict:
         ]
     )
 
+    # --- Status inquiry (just asking about the booking, not changing it) ---
+    if result.action == "status":
+        return {
+            "response": (
+                f"Your reservation is for {record['party_size']} on {record['date']} "
+                f"at {format_time_12h(record['time'])}, under {record['name']}. "
+                "It's still pending — our team will confirm shortly."
+            ),
+            "needs_human": False,
+        }
+
+    # --- Cancellation ---
+    if result.action == "cancel":
+        if within:
+            cancel_reservation(record["id"])
+            return {
+                "response": (
+                    f"Done — I've cancelled your reservation for {old_summary}. "
+                    "We hope to welcome you another time!"
+                ),
+                "needs_human": False,
+                "reservation_submitted": False,
+                "reservation_record": {},
+                "reservation_summary": "",
+            }
+        return {
+            "response": (
+                f"I've passed your request to cancel {old_summary} to our team — "
+                "they'll take care of it when they review. Sorry we'll miss you!"
+            ),
+            "needs_human": True,
+        }
+
+    # --- Change: only self-serve within the window ---
+    if not within:
+        return {
+            "response": (
+                f"Your request for {old_summary} has been in for over {window} minutes, "
+                "so our team will make any changes when they confirm — I've flagged your "
+                "note. What would you like changed?"
+            ),
+            "needs_human": True,
+        }
+
     # Keep current values for anything the customer didn't change.
     try:
-        new_time_raw = extraction.time or record["time"]
+        new_time_raw = result.time or record["time"]
         if not is_within_hours(new_time_raw):
             return {
                 "response": (
@@ -387,11 +499,11 @@ def _handle_reschedule(state: AgentState, record: dict) -> dict:
                 "needs_human": False,
             }
         revised = Reservation(
-            name=extraction.name or record["name"],
-            date=extraction.date or record["date"],
+            name=result.name or record["name"],
+            date=result.date or record["date"],
             time=snap_to_slot(new_time_raw),
-            party_size=extraction.party_size or record["party_size"],
-            phone=extraction.phone or record["phone"],
+            party_size=result.party_size or record["party_size"],
+            phone=result.phone or record["phone"],
         )
     except (ValueError, ValidationError):
         return {
@@ -399,14 +511,9 @@ def _handle_reschedule(state: AgentState, record: dict) -> dict:
             "needs_human": False,
         }
 
-    if datetime.strptime(revised.date, "%Y-%m-%d").date() < datetime.now().date():
-        return {
-            "response": (
-                f"That date ({revised.date}) has already passed — "
-                "what upcoming date would you like?"
-            ),
-            "needs_human": False,
-        }
+    date_problem = _check_reservation_date(revised.date)
+    if date_problem:
+        return {"response": date_problem, "needs_human": False}
 
     # Nothing actually changed yet -> ask what they want to change.
     if (
@@ -463,8 +570,18 @@ def _handle_reschedule(state: AgentState, record: dict) -> dict:
 
 
 def handle_other(state: AgentState) -> dict:
-    """Catch-all / low-confidence: polite hand-off, flag for a human."""
-    return {"response": HANDOFF_MESSAGE, "needs_human": True}
+    """Off-topic / unclear / out-of-scope: warm redirect, NO human escalation —
+    trivia and chit-chat shouldn't create staff follow-ups."""
+    llm = get_chat_model(temperature=0.3)
+    reply = llm.invoke(
+        [
+            SystemMessage(
+                content=OFF_TOPIC_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
+            ),
+            HumanMessage(content=state["user_message"]),
+        ]
+    )
+    return {"response": reply.content, "needs_human": False}
 
 
 def _ask_for_missing(missing: list[str]) -> str:

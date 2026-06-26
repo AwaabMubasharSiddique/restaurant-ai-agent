@@ -46,3 +46,13 @@ def test_update_modifies_row_by_id():
     updated = select("reservations", filters={"id": row["id"]}, order_by=None)[0]
     assert updated["time"] == "20:00"
     assert updated["party_size"] == 4
+
+
+def test_cancel_reservation_sets_status():
+    from tools.reservation import cancel_reservation
+
+    row = insert("reservations", {"date": "2099-01-01", "time": "19:00", "status": "pending"})
+    cancel_reservation(row["id"])
+
+    updated = select("reservations", filters={"id": row["id"]}, order_by=None)[0]
+    assert updated["status"] == "cancelled"

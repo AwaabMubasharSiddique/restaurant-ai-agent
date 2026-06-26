@@ -31,3 +31,6 @@ class AgentState(TypedDict, total=False):
     reservation_submitted: bool  # True once a request has been saved this session
     reservation_summary: str  # human-readable summary of that saved request
     reservation_record: dict  # the saved row (id, created_at, date, time, ...)
+
+    # Order-flow memory
+    pending_order: list  # priced items awaiting the customer's confirmation

@@ -48,6 +48,7 @@ class OrderItem(BaseModel):
 
     name: str
     quantity: int = Field(default=1, ge=1)
+    price: Optional[float] = None  # unit price, filled from the menu at order time
 
 
 class Reservation(BaseModel):
@@ -110,6 +111,27 @@ class ReservationExtraction(BaseModel):
 class OrderExtraction(BaseModel):
     items: List[OrderItem] = Field(default_factory=list)
     notes: Optional[str] = None
+
+
+class OrderTurn(BaseModel):
+    """One turn of the ordering flow: the customer's current full order, plus
+    whether they're confirming or cancelling the order in progress."""
+
+    items: List[OrderItem] = Field(default_factory=list)
+    confirm: bool = False
+    cancel: bool = False
+
+
+class RescheduleResult(BaseModel):
+    """A follow-up on an existing reservation: a status check, a cancellation, or
+    a set of revised details (optional fields, defaulting to current values)."""
+
+    action: Literal["status", "change", "cancel"] = "change"
+    name: Optional[str] = None
+    date: Optional[str] = None  # "YYYY-MM-DD"
+    time: Optional[str] = None  # "HH:MM"
+    party_size: Optional[int] = None
+    phone: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

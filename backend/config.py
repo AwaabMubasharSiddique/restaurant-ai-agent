@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     # Customers can self-reschedule a reservation within this many minutes of
     # creating it; after that, changes are handed to staff.
     reservation_edit_window_minutes: int = 30
+    # Furthest ahead (in days) a reservation can be booked.
+    max_advance_days: int = 30
 
     # --- RAG ---
     data_path: str = "data/restaurant_info.txt"

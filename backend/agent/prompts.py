@@ -6,7 +6,7 @@ Classify the customer's LATEST message into exactly one category:
 
 - reservation     : booking/changing/cancelling a table (dates, times, party size)
 - menu_question   : dishes, ingredients, prices, dietary options, allergens
-- order           : placing a food/drink order (takeout/pickup), adding items
+- order           : placing a food/drink order (takeout/pickup), adding items, or confirming an order in progress (e.g. a bare "yes"/"place it" right after an order summary)
 - hours_location  : opening hours, address, directions, parking, contact, policies
 - complaint       : dissatisfaction, a problem, a refund request, negative feedback
 - greeting        : greetings, thanks, goodbyes, and other small talk / pleasantries
@@ -48,33 +48,51 @@ Respond with genuine empathy in 2-3 sentences: acknowledge their experience,
 apologize sincerely, and assure them a team member will personally follow up.
 Do NOT promise refunds, comps, or specific outcomes — that is for staff to decide."""
 
-ORDER_SYSTEM_PROMPT = """Extract the customer's food/drink order from the conversation.
-Return a list of items, each with a name and quantity, plus any special notes
-(allergies, no onions, etc.). If the customer has not actually named any items
-yet, return an empty list."""
+ORDER_SYSTEM_PROMPT = """You take food/drink orders for a restaurant. Menu (name — price):
+{menu}
+
+Order in progress (not yet placed): {pending}
+
+Return the customer's order intent for the latest message, using the exact menu names:
+- `items`: the complete in-progress order (names + quantities). While the customer is still
+  building the order, include items they named earlier too — not just the newest addition.
+- Only include items the customer EXPLICITLY named. Do NOT read vague requests like
+  "everything", "all of it", or "one of each" as the whole menu. If no specific items are
+  named, return an empty items list.
+- If an order was already PLACED earlier (you'll see an "Order placed" message), that order is
+  finished — do NOT re-list it. Only include items if they're clearly starting a NEW order now;
+  if the latest message is just a comment or question (e.g. about an address or delivery),
+  return an empty items list.
+- confirm=true ONLY if the customer is agreeing to place the in-progress order ("yes", "place it").
+- cancel=true if they want to drop the in-progress order."""
 
 RESERVATION_SYSTEM_PROMPT = """Extract reservation details from the conversation for a restaurant.
 Today is {today}. Convert relative dates ("tomorrow", "this Friday") to an
-absolute date in YYYY-MM-DD. Express times in 24-hour HH:MM.
+absolute date in YYYY-MM-DD. Express times in 24-hour HH:MM. If a date is given
+without a year and that date has already passed this year, assume the next
+occurrence (next year).
 
 Only fill a field if the customer actually provided it in the conversation;
 otherwise leave it null. Required fields are: name, date, time, party_size, phone.
 Carry over details mentioned in earlier messages."""
 
-RESCHEDULE_SYSTEM_PROMPT = """The customer has an existing pending reservation and wants to change it.
+RESCHEDULE_SYSTEM_PROMPT = """The customer has an existing pending reservation. Decide the action:
+- "status": they are ASKING about their reservation (e.g. "when is my reservation", "what did I book") and are NOT changing it.
+- "cancel": they clearly want to cancel / drop the reservation entirely.
+- "change": they want to modify it, or it is unclear.
+
 Today is {today}.
 Current reservation -> name: {name}, date: {date}, time: {time} (24h), party_size: {party_size}, phone: {phone}.
 
-From the latest messages, return the REVISED reservation. For each field, use the
-customer's newest stated value; if they did not change a field, keep the current
-value shown above. Dates as YYYY-MM-DD, times as 24-hour HH:MM."""
+For "change", also return the REVISED reservation: for each field use the customer's newest
+stated value; if they did not change a field, keep the current value shown above.
+Dates as YYYY-MM-DD, times as 24-hour HH:MM."""
 
-# Polite, deterministic hand-off used for "other"/low-confidence turns.
-HANDOFF_MESSAGE = (
-    "I want to make sure you get the right help with this, so I've flagged your "
-    "message for a team member who'll follow up shortly. In the meantime, is "
-    "there anything about our menu, hours, or a reservation I can help with?"
-)
+OFF_TOPIC_SYSTEM_PROMPT = """You are the customer-service assistant for {restaurant}, a restaurant.
+The customer's latest message is off-topic or something you can't help with (trivia, jokes,
+chit-chat, unrelated requests). Reply warmly in ONE or two short sentences: let them know you
+can only help with our menu, hours & location, reservations, and orders, and invite them to
+ask about those. Do NOT try to answer the off-topic question. Don't be preachy or repetitive."""
 
 # Friendly phrasing for each missing reservation field.
 FIELD_PROMPTS = {
