@@ -75,6 +75,10 @@ class Reservation(BaseModel):
 
 class Order(BaseModel):
     items: List[OrderItem]
+    customer_name: str
+    phone: str
+    address: str  # delivery address
+    total: Optional[float] = None
     notes: Optional[str] = None
     status: OrderStatus = "pending"
     created_at: str = Field(default_factory=_utcnow_iso)
@@ -114,10 +118,14 @@ class OrderExtraction(BaseModel):
 
 
 class OrderTurn(BaseModel):
-    """One turn of the ordering flow: the customer's current full order, plus
-    whether they're confirming or cancelling the order in progress."""
+    """One turn of the ordering flow: the current order items, the customer's
+    contact details (name / phone / delivery address), and whether they're
+    confirming or cancelling the order in progress."""
 
     items: List[OrderItem] = Field(default_factory=list)
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
     confirm: bool = False
     cancel: bool = False
 

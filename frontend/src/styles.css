@@ -45,7 +45,8 @@ body {
 
 @media (max-width: 520px) {
   .chat-app {
-    height: 100vh;
+    height: 100vh; /* fallback */
+    height: 100dvh; /* tracks the mobile address bar + keyboard so the input stays visible */
     border-radius: 0;
     max-width: 100%;
   }
@@ -226,16 +227,19 @@ body {
   display: flex;
   gap: 10px;
   padding: 14px 16px;
+  /* Respect the home-indicator / notch safe area on phones. */
+  padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   background: var(--surface);
   border-top: 1px solid var(--border);
 }
 
 .chat-input input {
   flex: 1;
+  min-width: 0; /* let the input shrink instead of overflowing on narrow screens */
   border: 1px solid var(--border);
   border-radius: 22px;
   padding: 12px 16px;
-  font-size: 14.5px;
+  font-size: 16px; /* >=16px stops iOS Safari from auto-zooming on focus */
   outline: none;
   background: var(--cream);
   transition: border-color 0.15s ease;

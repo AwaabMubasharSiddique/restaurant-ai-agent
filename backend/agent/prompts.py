@@ -48,23 +48,23 @@ Respond with genuine empathy in 2-3 sentences: acknowledge their experience,
 apologize sincerely, and assure them a team member will personally follow up.
 Do NOT promise refunds, comps, or specific outcomes — that is for staff to decide."""
 
-ORDER_SYSTEM_PROMPT = """You take food/drink orders for a restaurant. Menu (name — price):
+ORDER_SYSTEM_PROMPT = """You take food/drink orders for a restaurant (for delivery). Menu (name — price):
 {menu}
 
 Order in progress (not yet placed): {pending}
 
-Return the customer's order intent for the latest message, using the exact menu names:
-- `items`: the complete in-progress order (names + quantities). While the customer is still
-  building the order, include items they named earlier too — not just the newest addition.
-- Only include items the customer EXPLICITLY named. Do NOT read vague requests like
-  "everything", "all of it", or "one of each" as the whole menu. If no specific items are
-  named, return an empty items list.
-- If an order was already PLACED earlier (you'll see an "Order placed" message), that order is
-  finished — do NOT re-list it. Only include items if they're clearly starting a NEW order now;
-  if the latest message is just a comment or question (e.g. about an address or delivery),
-  return an empty items list.
-- confirm=true ONLY if the customer is agreeing to place the in-progress order ("yes", "place it").
-- cancel=true if they want to drop the in-progress order."""
+From the conversation, return the customer's order intent for the latest message:
+- `items`: the complete in-progress order (exact menu names + quantities). While the customer
+  is still building the order, include items they named earlier too — not just the newest one.
+  Only items they EXPLICITLY named — do NOT read "everything" / "all of it" as the whole menu;
+  if none are named, return an empty list.
+- `name`, `phone`, `address`: the customer's name, phone number, and delivery address, if they
+  have given them (carry these over from earlier messages; leave null if not yet provided).
+- `confirm`: true ONLY if the customer is agreeing to place the in-progress order ("yes", "place it").
+- `cancel`: true if they want to drop the in-progress order.
+
+If an order was already PLACED earlier (you'll see an "Order placed" message), it's finished —
+do NOT re-list it; only include items if they're clearly starting a NEW order now."""
 
 RESERVATION_SYSTEM_PROMPT = """Extract reservation details from the conversation for a restaurant.
 Today is {today}. Convert relative dates ("tomorrow", "this Friday") to an

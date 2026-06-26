@@ -177,12 +177,22 @@ create table reservations (
 );
 
 create table orders (
-  id          uuid primary key default gen_random_uuid(),
-  items       jsonb not null,         -- [{name, quantity}, ...]
-  notes       text,
-  status      text not null default 'pending',
-  created_at  timestamptz not null default now()
+  id             uuid primary key default gen_random_uuid(),
+  items          jsonb not null,        -- [{name, quantity, price}, ...]
+  customer_name  text,
+  phone          text,
+  address        text,                  -- delivery address
+  total          numeric,
+  notes          text,
+  status         text not null default 'pending',
+  created_at     timestamptz not null default now()
 );
+-- Already have an older orders table? Add the new columns:
+--   alter table orders
+--     add column customer_name text,
+--     add column phone text,
+--     add column address text,
+--     add column total numeric;
 
 create table conversation_logs (
   id              uuid primary key default gen_random_uuid(),

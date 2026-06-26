@@ -99,6 +99,13 @@ def _check_reservation_date(date_str: str) -> str | None:
     return None
 
 
+def _natural_join(phrases: list[str]) -> str:
+    """'a' / 'a and b' / 'a, b, and c'."""
+    if len(phrases) == 1:
+        return phrases[0]
+    return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+
+
 # ---------------------------------------------------------------------------
 # 1. Intent classification + routing
 # ---------------------------------------------------------------------------
@@ -215,24 +222,7 @@ def handle_order(state: AgentState) -> dict:
             "pending_order": [],
         }
 
-    # Place the order the customer is confirming.
-    if turn.confirm and pending:
-        items = [
-            OrderItem(name=i["name"], quantity=i["quantity"], price=i["price"]) for i in pending
-        ]
-        save_order(Order(items=items))
-        return {
-            "response": (
-                "Order placed! ✅\n"
-                f"{_bill_lines(pending)}\n"
-                f"Total: ${order_total(pending):.2f}\n"
-                "It's pending — the kitchen will confirm shortly. Payment on pickup."
-            ),
-            "needs_human": False,
-            "pending_order": [],
-        }
-
-    # New / updated items -> price them, show the bill, and ask to confirm.
+    # Determine the order's items: newly named ones, else the order in progress.
     if turn.items:
         priced, unknown = price_items(turn.items)
         if not priced:
@@ -244,36 +234,85 @@ def handle_order(state: AgentState) -> dict:
                 ),
                 "needs_human": False,
             }
-        note = (
-            f"\n\n(I couldn't find {', '.join(unknown)} on our menu, so I left those out.)"
-            if unknown
-            else ""
-        )
+    elif pending:
+        priced, unknown = pending, []
+    else:
+        priced, unknown = [], []
+
+    if not priced:
+        if turn.confirm:
+            return {
+                "response": "I don't have an order started yet — what would you like to order?",
+                "needs_human": False,
+            }
         return {
             "response": (
-                "Here's your order:\n"
-                f"{_bill_lines(priced)}\n"
-                f"Total: ${order_total(priced):.2f}{note}\n\n"
-                "Shall I place it? It'll be pending until the kitchen confirms. (Payment on pickup.)"
+                "I'd love to take your order! What would you like? "
+                "You can ask to see the menu too."
+            ),
+            "needs_human": False,
+        }
+
+    unknown_note = (
+        f"\n\n(I couldn't find {', '.join(unknown)} on our menu, so I left those out.)"
+        if unknown
+        else ""
+    )
+    bill = f"{_bill_lines(priced)}\nTotal: ${order_total(priced):.2f}"
+
+    # Need name + phone + delivery address before the order can be placed.
+    missing_contact = []
+    if not turn.name:
+        missing_contact.append("your name")
+    if not turn.phone:
+        missing_contact.append("a phone number")
+    if not turn.address:
+        missing_contact.append("a delivery address")
+
+    if missing_contact:
+        return {
+            "response": (
+                f"Here's your order:\n{bill}{unknown_note}\n\n"
+                f"To place it for delivery, could you share {_natural_join(missing_contact)}?"
             ),
             "needs_human": False,
             "pending_order": priced,
         }
 
-    # "Confirm" but nothing is in progress.
+    # Items + contact present. Confirm -> place; otherwise show the full summary.
     if turn.confirm:
+        items = [
+            OrderItem(name=i["name"], quantity=i["quantity"], price=i["price"]) for i in priced
+        ]
+        total = order_total(priced)
+        save_order(
+            Order(
+                items=items,
+                customer_name=turn.name,
+                phone=turn.phone,
+                address=turn.address,
+                total=total,
+            )
+        )
         return {
-            "response": "I don't have an order started yet — what would you like to order?",
+            "response": (
+                f"Order placed! ✅\n{_bill_lines(priced)}\n"
+                f"Total: ${total:.2f}\n"
+                f"Delivering to {turn.address}, under {turn.name} ({turn.phone}). "
+                "It's pending — the kitchen will confirm shortly. Payment on delivery."
+            ),
             "needs_human": False,
+            "pending_order": [],
         }
 
-    # Nothing actionable yet.
     return {
         "response": (
-            "I'd love to take your order! What would you like? "
-            "You can ask to see the menu too."
+            f"Here's your order:\n{bill}{unknown_note}\n\n"
+            f"Delivering to {turn.address}, under {turn.name} ({turn.phone}). "
+            "Shall I place it? (pending until the kitchen confirms; payment on delivery)"
         ),
         "needs_human": False,
+        "pending_order": priced,
     }
 
 

@@ -27,7 +27,12 @@ def test_reservation_requires_positive_party_size():
 
 
 def test_order_defaults_and_item_quantity():
-    order = Order(items=[OrderItem(name="Margherita Pizza", quantity=2)])
+    order = Order(
+        items=[OrderItem(name="Margherita Pizza", quantity=2)],
+        customer_name="Ada",
+        phone="555",
+        address="12 Main St",
+    )
     assert order.status == "pending"
     assert order.items[0].quantity == 2
 
