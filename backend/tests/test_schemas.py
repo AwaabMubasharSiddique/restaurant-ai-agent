@@ -1,4 +1,3 @@
-"""Tests for the domain models: defaults and validation."""
 import pytest
 from pydantic import ValidationError
 

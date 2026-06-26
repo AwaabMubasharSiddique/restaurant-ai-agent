@@ -1,5 +1,3 @@
-"""Single place that builds the chat model, so the model name and API key
-(both from the environment) are configured once."""
 from __future__ import annotations
 
 from langchain_openai import ChatOpenAI

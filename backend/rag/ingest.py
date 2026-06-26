@@ -1,14 +1,3 @@
-"""Ingest the restaurant's knowledge (menu + info) into a FAISS vector store.
-
-Pipeline:  load file  ->  split into chunks  ->  embed  ->  save FAISS index
-
-Run it directly to (re)build the index:
-
-    python -m rag.ingest
-
-The source is a .txt or .pdf file (DATA_PATH). When the menu changes, edit the
-file and re-run this script; the agent picks up the new index automatically.
-"""
 from __future__ import annotations
 
 import os
@@ -22,7 +11,6 @@ from config import settings
 
 
 def get_embeddings() -> OpenAIEmbeddings:
-    """text-embedding-3-small: cheap, fast, and plenty accurate for a menu/FAQ."""
     return OpenAIEmbeddings(
         model=settings.openai_embedding_model,
         api_key=settings.openai_api_key,
@@ -45,9 +33,6 @@ def build_index(data_path: str | None = None, index_path: str | None = None) -> 
 
     documents = _load_documents(data_path)
 
-    # Chunk on natural boundaries (blank lines, then lines) so a menu section or
-    # policy paragraph mostly stays intact inside one chunk. Overlap preserves
-    # context that straddles a boundary.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=120,

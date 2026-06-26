@@ -172,6 +172,7 @@ create table reservations (
   time        text not null,          -- "HH:MM" slot start
   party_size  int  not null,
   phone       text not null,
+  table_id    text,                   -- assigned table, e.g. "T3" (null = staff-seated)
   status      text not null default 'pending',
   created_at  timestamptz not null default now()
 );
@@ -226,9 +227,9 @@ polite human hand-off (`needs_human = true`).
 - `complaint` — empathetic reply, `needs_human = true`.
 - `order` — extract items, save `pending`.
 - `reservation` — gather details across turns, then guard the request: reject
-  past dates and times outside opening hours, hand parties of
-  `LARGE_PARTY_THRESHOLD`+ to staff (`needs_human`), otherwise check the slot and
-  save `pending` or offer the nearest open slots.
+  past dates and times outside opening hours, hand parties too big for the
+  largest table to staff (`needs_human`), otherwise assign a free table that
+  fits and save `pending`, or offer the nearest open slots.
 - `other` / low-confidence — hand off to a human.
 
 **Memory.** The compiled graph uses a checkpointer keyed by `thread_id =
@@ -237,22 +238,24 @@ after, so multi-turn reservations ("a table for two" … "Friday 7pm" … "John,
 555-…") accumulate naturally. Swap `MemorySaver` for `SqliteSaver`/Postgres in
 `agent/memory.py` for durability — no node changes.
 
-**Availability (per-slot counting).** A day is split into fixed slots
-(`RESERVATION_SLOT_MINUTES`). For a requested date+time we count active
-(`pending`/`confirmed`) reservations in that slot and compare to
-`MAX_RESERVATIONS_PER_SLOT`. Under cap → save `pending`. Full → suggest the
-closest open slots. We are **not** modeling individual tables yet.
+**Availability (table-level booking).** The dining room is a fixed set of
+tables (`RESTAURANT_TABLES` in `config.py`, e.g. `T1`/`T2` = 4 seats, `T3` = 8).
+For a requested date+time we assign the **smallest free table that fits the
+party** (tightest-fit, so the big table stays open for big groups) and hold it
+for `SEATING_DURATION_MINUTES`. Two parties can therefore never be given the
+same table at overlapping times, and a 7:00 booking still blocks part of 8:00 on
+that table. No free table → suggest the closest open slots. A party larger than
+the biggest table can't sit at one table, so it's handed to staff (joining
+tables is a human call). Rescheduling re-runs the assignment, excluding the
+booking's own row so it doesn't clash with itself.
 
-### Extending slot-counting to real tables
+### What's modeled vs. what's next
 
-Replace the single integer cap in `tools/availability.py` with:
-1. a **table inventory** (id, seats, indoor/outdoor, joinable);
-2. an **assignment check** — can `party_size` be seated given what's already
-   booked? (bin-packing rather than `count < cap`);
-3. a **seating duration** so a 7:00 booking partially blocks 8:00.
-
-Because availability is isolated behind `is_available()` /
-`nearby_open_slots()`, the agent and graph don't change.
+Modeled: per-table assignment, seat-count fit, seating duration. Not yet:
+indoor/outdoor or joinable tables, variable seating durations by party size, and
+table merging for large groups. Because availability is isolated behind
+`find_table()` / `is_available()` / `nearby_open_slots()`, adding those doesn't
+touch the agent or graph.
 
 ### Why a human stays the final approver
 

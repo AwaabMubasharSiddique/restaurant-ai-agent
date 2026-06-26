@@ -1,13 +1,3 @@
-"""Thin persistence layer used by every tool.
-
-If Supabase is configured (SUPABASE_URL + SUPABASE_KEY) we write/read there.
-Otherwise we fall back to a process-local in-memory store, so the whole demo
-runs end-to-end with zero external services. The rest of the code never needs
-to know which backend is active.
-
-Every row gets a `created_at` ISO timestamp, and reads default to newest-first,
-because the restaurant watches these tables directly (no notifications in v1).
-"""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -18,19 +8,18 @@ from uuid import uuid4
 
 from config import settings
 
-try:  # supabase is optional at runtime
+try:
     from supabase import Client, create_client
-except ImportError:  # pragma: no cover
-    Client = None  # type: ignore
-    create_client = None  # type: ignore
+except ImportError:
+    Client = None
+    create_client = None
 
-# In-memory fallback: { table_name: [row, row, ...] }
+
 _MEMORY: dict[str, list[dict]] = defaultdict(list)
 
 
 @lru_cache(maxsize=1)
 def get_supabase():
-    """Return a Supabase client, or None to use the in-memory fallback."""
     if create_client and settings.supabase_url and settings.supabase_key:
         return create_client(settings.supabase_url, settings.supabase_key)
     return None
@@ -41,7 +30,6 @@ def _now_iso() -> str:
 
 
 def insert(table: str, row: dict[str, Any]) -> dict[str, Any]:
-    """Insert one row. Stamps created_at if the caller didn't."""
     row = dict(row)
     row.setdefault("created_at", _now_iso())
 
@@ -50,13 +38,12 @@ def insert(table: str, row: dict[str, Any]) -> dict[str, Any]:
         result = client.table(table).insert(row).execute()
         return result.data[0] if result.data else row
 
-    row.setdefault("id", str(uuid4()))  # Supabase generates its own; memory needs one
+    row.setdefault("id", str(uuid4()))
     _MEMORY[table].append(row)
     return row
 
 
 def update(table: str, row_id: str, changes: dict[str, Any]) -> dict[str, Any]:
-    """Update the row identified by `id` and return the updated row."""
     client = get_supabase()
     if client is not None:
         result = client.table(table).update(dict(changes)).eq("id", row_id).execute()
@@ -75,7 +62,6 @@ def select(
     order_by: str | None = "created_at",
     descending: bool = True,
 ) -> list[dict[str, Any]]:
-    """Read rows, optionally filtered by equality and ordered (newest-first)."""
     client = get_supabase()
     if client is not None:
         query = client.table(table).select("*")

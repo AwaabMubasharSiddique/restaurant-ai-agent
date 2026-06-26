@@ -2,10 +2,6 @@ import { useRef, useState } from 'react'
 import ChatWindow from './components/ChatWindow.jsx'
 import { sendMessage } from './api.js'
 
-// Persist the session id so a page refresh continues the same conversation.
-// crypto.randomUUID only exists in secure contexts (https / localhost); if it's
-// unavailable we start with null and adopt the id the server mints on the first
-// reply.
 function loadSessionId() {
   const existing = localStorage.getItem('session_id')
   if (existing) return existing
@@ -31,13 +27,11 @@ export default function App() {
   const sessionId = useRef(loadSessionId())
 
   async function handleSend(text) {
-    // Optimistically show the user's message.
     setMessages((prev) => [...prev, { role: 'user', text }])
     setLoading(true)
 
     try {
       const data = await sendMessage(text, sessionId.current)
-      // The server may mint a session id on the first turn — adopt it.
       if (data.session_id) {
         sessionId.current = data.session_id
         localStorage.setItem('session_id', data.session_id)

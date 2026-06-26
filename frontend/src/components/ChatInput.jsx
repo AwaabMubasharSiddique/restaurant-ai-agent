@@ -4,8 +4,6 @@ export default function ChatInput({ onSend, disabled }) {
   const [value, setValue] = useState('')
   const inputRef = useRef(null)
 
-  // Re-focus the input whenever it becomes enabled again (i.e. right after the
-  // reply arrives), so the user can keep typing without clicking back in.
   useEffect(() => {
     if (!disabled) inputRef.current?.focus()
   }, [disabled])

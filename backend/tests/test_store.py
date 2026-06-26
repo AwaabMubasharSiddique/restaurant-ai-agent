@@ -1,5 +1,3 @@
-"""Tests for the persistence fallback: stamping created_at, filtering, and the
-newest-first ordering the restaurant relies on when reading tables directly."""
 from tools.store import insert, select, update
 
 
@@ -17,7 +15,7 @@ def test_select_orders_newest_first():
     insert("conversation_logs", {"conversation_id": "old", "created_at": "2020-01-01T00:00:00+00:00"})
     insert("conversation_logs", {"conversation_id": "new", "created_at": "2024-01-01T00:00:00+00:00"})
 
-    rows = select("conversation_logs")  # defaults to created_at desc
+    rows = select("conversation_logs")
 
     assert rows[0]["conversation_id"] == "new"
     assert rows[1]["conversation_id"] == "old"
@@ -35,7 +33,7 @@ def test_select_filters_by_equality():
 
 def test_insert_assigns_id_in_memory():
     row = insert("reservations", {"date": "2099-01-01", "time": "19:00"})
-    assert row.get("id")  # needed so rows can be updated in place
+    assert row.get("id")
 
 
 def test_update_modifies_row_by_id():

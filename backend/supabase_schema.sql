@@ -11,9 +11,14 @@ create table if not exists reservations (
   time        text not null,                 -- "HH:MM" slot start
   party_size  int  not null,
   phone       text not null,
+  table_id    text,                          -- assigned table, e.g. "T3" (null = staff-seated)
   status      text not null default 'pending',
   created_at  timestamptz not null default now()
 );
+
+-- Adds the table assignment column to an older reservations table (no-op on a
+-- fresh one):
+alter table reservations add column if not exists table_id text;
 
 -- ── Orders ────────────────────────────────────────────────────
 create table if not exists orders (

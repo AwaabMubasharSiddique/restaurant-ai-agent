@@ -1,8 +1,3 @@
-"""Graph nodes. Each node takes the full AgentState and returns a partial dict
-that LangGraph merges back into the state.
-
-Flow:  classify_intent -> (router) -> one handler -> persist_log -> END
-"""
 from __future__ import annotations
 
 import logging
@@ -39,9 +34,11 @@ from models.schemas import (
 from menu import format_menu_for_prompt, order_total, price_items
 from rag.retriever import retrieve
 from tools.availability import (
+    find_table,
     format_time_12h,
     is_available,
     is_within_hours,
+    max_table_seats,
     nearby_open_slots,
     snap_to_slot,
     within_edit_window,
@@ -52,7 +49,7 @@ from tools.reservation import cancel_reservation, save_reservation, update_reser
 
 logger = logging.getLogger("restaurant-ai.agent")
 
-# Maps each routable intent (and the low-confidence case) to a handler node name.
+
 INTENT_TO_NODE = {
     "reservation": "handle_reservation",
     "menu_question": "handle_menu_question",
@@ -66,7 +63,6 @@ HANDLER_NODES = list(dict.fromkeys(INTENT_TO_NODE.values()))
 
 
 def _format_history(messages: list, limit: int = 12) -> str:
-    """Render recent turns as plain text for prompts that need full context."""
     lines = []
     for message in messages[-limit:]:
         role = "Customer" if message.type == "human" else "Assistant"
@@ -75,15 +71,12 @@ def _format_history(messages: list, limit: int = 12) -> str:
 
 
 def _bill_lines(priced: list) -> str:
-    """Render priced order items as bullet lines with per-line subtotals."""
     return "\n".join(
         f"- {i['quantity']}× {i['name']} — ${i['price'] * i['quantity']:.2f}" for i in priced
     )
 
 
 def _check_reservation_date(date_str: str) -> str | None:
-    """Return an error message if the date is in the past or beyond the booking
-    window (max_advance_days), else None."""
     requested = datetime.strptime(date_str, "%Y-%m-%d").date()
     today = datetime.now().date()
     if requested < today:
@@ -100,15 +93,11 @@ def _check_reservation_date(date_str: str) -> str | None:
 
 
 def _natural_join(phrases: list[str]) -> str:
-    """'a' / 'a and b' / 'a, b, and c'."""
     if len(phrases) == 1:
         return phrases[0]
     return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
 
 
-# ---------------------------------------------------------------------------
-# 1. Intent classification + routing
-# ---------------------------------------------------------------------------
 def classify_intent(state: AgentState) -> dict:
     llm = get_chat_model(temperature=0).with_structured_output(IntentResult)
     history = _format_history(state.get("messages", []))
@@ -127,17 +116,12 @@ def classify_intent(state: AgentState) -> dict:
 
 
 def route_intent(state: AgentState) -> str:
-    """Conditional edge: pick the handler node based on intent + confidence."""
     if state.get("confidence", 1.0) < settings.low_confidence_threshold:
-        return "handle_other"  # not sure enough -> hand off to a human
+        return "handle_other"
     return INTENT_TO_NODE.get(state.get("intent", "other"), "handle_other")
 
 
-# ---------------------------------------------------------------------------
-# 2. Handlers
-# ---------------------------------------------------------------------------
 def handle_menu_question(state: AgentState) -> dict:
-    # Pull more chunks for menu questions so "show me the menu" gets the full list.
     context = retrieve(state["user_message"], k=settings.menu_retrieval_k)
     llm = get_chat_model(temperature=0.2)
     reply = llm.invoke(
@@ -177,12 +161,11 @@ def handle_complaint(state: AgentState) -> dict:
             HumanMessage(content=state["user_message"]),
         ]
     )
-    # A complaint always escalates to a person.
+
     return {"response": reply.content, "needs_human": True}
 
 
 def handle_greeting(state: AgentState) -> dict:
-    """Greetings, thanks, goodbyes — reply warmly, do NOT escalate to a human."""
     llm = get_chat_model(temperature=0.5)
     reply = llm.invoke(
         [
@@ -214,7 +197,6 @@ def handle_order(state: AgentState) -> dict:
         ]
     )
 
-    # Drop an order in progress.
     if turn.cancel and pending:
         return {
             "response": "No problem — I've cleared that order. Anything else?",
@@ -222,7 +204,6 @@ def handle_order(state: AgentState) -> dict:
             "pending_order": [],
         }
 
-    # Determine the order's items: newly named ones, else the order in progress.
     if turn.items:
         priced, unknown = price_items(turn.items)
         if not priced:
@@ -260,7 +241,6 @@ def handle_order(state: AgentState) -> dict:
     )
     bill = f"{_bill_lines(priced)}\nTotal: ${order_total(priced):.2f}"
 
-    # Need name + phone + delivery address before the order can be placed.
     missing_contact = []
     if not turn.name:
         missing_contact.append("your name")
@@ -279,7 +259,6 @@ def handle_order(state: AgentState) -> dict:
             "pending_order": priced,
         }
 
-    # Items + contact present. Confirm -> place; otherwise show the full summary.
     if turn.confirm:
         items = [
             OrderItem(name=i["name"], quantity=i["quantity"], price=i["price"]) for i in priced
@@ -317,9 +296,6 @@ def handle_order(state: AgentState) -> dict:
 
 
 def handle_reservation(state: AgentState) -> dict:
-    # A request was already saved this session -> reschedule flow (self-service
-    # within the edit window, otherwise hand the change to staff). Never silently
-    # save a duplicate row.
     if state.get("reservation_submitted"):
         record = state.get("reservation_record")
         if record and record.get("id"):
@@ -348,7 +324,6 @@ def handle_reservation(state: AgentState) -> dict:
         ]
     )
 
-    # Which required details are still missing? (party_size 0/None both count.)
     required = {
         "name": extraction.name,
         "date": extraction.date,
@@ -360,7 +335,6 @@ def handle_reservation(state: AgentState) -> dict:
     if missing:
         return {"response": _ask_for_missing(missing), "needs_human": False}
 
-    # All details present — validate the date/time and snap to a real slot.
     try:
         requested_date = datetime.strptime(extraction.date, "%Y-%m-%d").date()
         if not is_within_hours(extraction.time):
@@ -389,14 +363,11 @@ def handle_reservation(state: AgentState) -> dict:
             "needs_human": False,
         }
 
-    # Reject past dates and dates beyond the booking window.
     date_problem = _check_reservation_date(reservation.date)
     if date_problem:
         return {"response": date_problem, "needs_human": False}
 
-    # Large groups are coordinated by staff directly (a set menu may apply), so
-    # we capture the request as pending and hand it to a person.
-    if reservation.party_size >= settings.large_party_threshold:
+    if reservation.party_size > max_table_seats():
         saved = save_reservation(reservation)
         summary = (
             f"{reservation.party_size} on {reservation.date} "
@@ -404,11 +375,11 @@ def handle_reservation(state: AgentState) -> dict:
         )
         return {
             "response": (
-                f"Thanks, {reservation.name}! For a group of {reservation.party_size} "
-                f"on {reservation.date} at {format_time_12h(reservation.time)}, I've "
-                f"logged your request as pending and a team member will reach out "
-                f"personally to arrange the details. We'll contact you at "
-                f"{reservation.phone}."
+                f"Thanks, {reservation.name}! A group of {reservation.party_size} is "
+                f"larger than any single table, so I've logged your request for "
+                f"{reservation.date} at {format_time_12h(reservation.time)} as pending and "
+                f"a team member will reach out personally to arrange the seating. "
+                f"We'll contact you at {reservation.phone}."
             ),
             "needs_human": True,
             "reservation_submitted": True,
@@ -416,8 +387,9 @@ def handle_reservation(state: AgentState) -> dict:
             "reservation_record": saved,
         }
 
-    # Availability check BEFORE we offer anything (simple per-slot counting).
-    if is_available(reservation.date, reservation.time):
+    table_id = find_table(reservation.date, reservation.time, reservation.party_size)
+    if table_id:
+        reservation.table_id = table_id
         saved = save_reservation(reservation)
         pretty_time = format_time_12h(reservation.time)
         summary = f"{reservation.party_size} on {reservation.date} at {pretty_time}"
@@ -434,29 +406,29 @@ def handle_reservation(state: AgentState) -> dict:
             "reservation_record": saved,
         }
 
-    # Slot is full: offer the nearest open slots and let the customer choose.
-    alternatives = nearby_open_slots(reservation.date, reservation.time)
+    alternatives = nearby_open_slots(
+        reservation.date, reservation.time, reservation.party_size
+    )
     if alternatives:
         pretty = ", ".join(format_time_12h(s) for s in alternatives)
         return {
             "response": (
-                f"That time on {reservation.date} is fully reserved, but we do have "
-                f"openings at {pretty}. Would any of those work for you?"
+                f"That time on {reservation.date} is fully booked for a party of "
+                f"{reservation.party_size}, but we have openings at {pretty}. "
+                f"Would any of those work for you?"
             ),
             "needs_human": False,
         }
     return {
         "response": (
-            f"I'm so sorry — we're fully reserved on {reservation.date}. "
-            f"Would another day work? I'm happy to check availability."
+            f"I'm so sorry — we're fully booked for a party of {reservation.party_size} "
+            f"on {reservation.date}. Would another day work? I'm happy to check."
         ),
         "needs_human": False,
     }
 
 
 def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
-    """Change OR cancel an already-submitted reservation in place if still within
-    the edit window; otherwise hand it to staff. (Reservations only — not orders.)"""
     window = settings.reservation_edit_window_minutes
     old_summary = state.get("reservation_summary", "your reservation")
     within = within_edit_window(record.get("created_at", ""), window)
@@ -482,7 +454,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
         ]
     )
 
-    # --- Status inquiry (just asking about the booking, not changing it) ---
     if result.action == "status":
         return {
             "response": (
@@ -493,7 +464,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             "needs_human": False,
         }
 
-    # --- Cancellation ---
     if result.action == "cancel":
         if within:
             cancel_reservation(record["id"])
@@ -515,7 +485,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             "needs_human": True,
         }
 
-    # --- Change: only self-serve within the window ---
     if not within:
         return {
             "response": (
@@ -526,7 +495,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             "needs_human": True,
         }
 
-    # Keep current values for anything the customer didn't change.
     try:
         new_time_raw = result.time or record["time"]
         if not is_within_hours(new_time_raw):
@@ -554,7 +522,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
     if date_problem:
         return {"response": date_problem, "needs_human": False}
 
-    # Nothing actually changed yet -> ask what they want to change.
     if (
         revised.date == record["date"]
         and revised.time == record["time"]
@@ -567,41 +534,71 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             "needs_human": False,
         }
 
-    # If the slot moved, make sure the new one isn't full.
-    slot_moved = revised.date != record["date"] or revised.time != record["time"]
-    if slot_moved and not is_available(revised.date, revised.time):
-        alternatives = nearby_open_slots(revised.date, revised.time)
-        if alternatives:
-            pretty = ", ".join(format_time_12h(s) for s in alternatives)
+    too_big = revised.party_size > max_table_seats()
+    needs_reseat = (
+        revised.date != record["date"]
+        or revised.time != record["time"]
+        or revised.party_size != record["party_size"]
+    )
+    new_table_id = record.get("table_id")
+    if too_big:
+        new_table_id = None
+    elif needs_reseat:
+        new_table_id = find_table(
+            revised.date, revised.time, revised.party_size, exclude_id=record["id"]
+        )
+        if not new_table_id:
+            alternatives = nearby_open_slots(
+                revised.date, revised.time, revised.party_size, exclude_id=record["id"]
+            )
+            if alternatives:
+                pretty = ", ".join(format_time_12h(s) for s in alternatives)
+                return {
+                    "response": (
+                        f"That change leaves no free table on {revised.date} at "
+                        f"{format_time_12h(revised.time)} for a party of "
+                        f"{revised.party_size}, but we have openings at {pretty}. "
+                        f"Want one of those?"
+                    ),
+                    "needs_human": False,
+                }
             return {
                 "response": (
-                    f"That new time on {revised.date} is fully reserved, but we have "
-                    f"openings at {pretty}. Want one of those?"
+                    f"We're fully booked on {revised.date} for a party of "
+                    f"{revised.party_size}. Would another day work?"
                 ),
                 "needs_human": False,
             }
-        return {
-            "response": f"We're fully reserved on {revised.date}. Would another day work?",
-            "needs_human": False,
-        }
 
-    # Apply the change to the SAME row (keep id / status / created_at).
     changes = {
         "name": revised.name,
         "date": revised.date,
         "time": revised.time,
         "party_size": revised.party_size,
         "phone": revised.phone,
+        "table_id": new_table_id,
     }
     update_reservation(record["id"], changes)
     new_record = {**record, **changes}
     new_summary = f"{revised.party_size} on {revised.date} at {format_time_12h(revised.time)}"
+    if too_big:
+        return {
+            "response": (
+                f"Thanks, {revised.name} — a group of {revised.party_size} is larger than "
+                f"any single table, so I've updated your request to {new_summary} and our "
+                f"team will arrange the seating personally. It's still pending."
+            ),
+            "needs_human": True,
+            "reservation_submitted": True,
+            "reservation_record": new_record,
+            "reservation_summary": new_summary,
+        }
     return {
         "response": (
             f"All set, {revised.name} — I've updated your reservation to {new_summary}. "
             "It's still pending and our team will confirm shortly."
         ),
-        "needs_human": revised.party_size >= settings.large_party_threshold,
+        "needs_human": False,
         "reservation_submitted": True,
         "reservation_record": new_record,
         "reservation_summary": new_summary,
@@ -609,8 +606,6 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
 
 
 def handle_other(state: AgentState) -> dict:
-    """Off-topic / unclear / out-of-scope: warm redirect, NO human escalation —
-    trivia and chit-chat shouldn't create staff follow-ups."""
     llm = get_chat_model(temperature=0.3)
     reply = llm.invoke(
         [
@@ -632,9 +627,6 @@ def _ask_for_missing(missing: list[str]) -> str:
     return f"I'd be glad to help set that up! Could you share {ask}?"
 
 
-# ---------------------------------------------------------------------------
-# 3. Logging (runs for every turn, then END)
-# ---------------------------------------------------------------------------
 def persist_log(state: AgentState) -> dict:
     response = state.get("response", "")
     log = ConversationLog(
@@ -646,8 +638,7 @@ def persist_log(state: AgentState) -> dict:
     )
     try:
         log_conversation(log)
-    except Exception:  # logging must never break the chat
+    except Exception:
         logger.exception("Failed to log conversation for session %s", state["session_id"])
 
-    # Append the assistant reply to history so the next turn has full context.
     return {"messages": [AIMessage(content=response)]}

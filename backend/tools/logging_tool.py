@@ -1,5 +1,3 @@
-"""Conversation logging. Every turn is recorded so the restaurant can review
-chats, audit the agent, and spot messages flagged needs_human."""
 from __future__ import annotations
 
 from typing import Any

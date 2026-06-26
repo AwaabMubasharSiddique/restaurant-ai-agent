@@ -1,4 +1,3 @@
-"""System prompts and canned strings for the agent's nodes, kept in one place."""
 from __future__ import annotations
 
 INTENT_SYSTEM_PROMPT = """You are the intent classifier for a restaurant's customer-service assistant.
@@ -94,7 +93,7 @@ chit-chat, unrelated requests). Reply warmly in ONE or two short sentences: let 
 can only help with our menu, hours & location, reservations, and orders, and invite them to
 ask about those. Do NOT try to answer the off-topic question. Don't be preachy or repetitive."""
 
-# Friendly phrasing for each missing reservation field.
+
 FIELD_PROMPTS = {
     "name": "the name for the reservation",
     "date": "the date you'd like to come in",

@@ -4,7 +4,6 @@ import Message from './Message.jsx'
 export default function MessageList({ messages, loading }) {
   const bottomRef = useRef(null)
 
-  // Auto-scroll to the newest message (or the typing indicator).
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])

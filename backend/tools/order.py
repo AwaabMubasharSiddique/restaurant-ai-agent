@@ -1,4 +1,3 @@
-"""Order persistence."""
 from __future__ import annotations
 
 from typing import Any
@@ -8,5 +7,4 @@ from tools.store import insert
 
 
 def save_order(order: Order) -> dict[str, Any]:
-    """Persist an order as 'pending'. The kitchen confirms it out-of-band."""
     return insert("orders", order.model_dump(mode="json"))

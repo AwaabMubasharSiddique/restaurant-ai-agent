@@ -1,4 +1,3 @@
-"""Tests for the structured menu: lookup (exact/fuzzy/miss), pricing, totals."""
 from menu import find_menu_item, order_total, price_items
 from models.schemas import OrderItem
 
@@ -9,8 +8,8 @@ def test_find_menu_item_exact_and_caseless():
 
 
 def test_find_menu_item_fuzzy_and_miss():
-    assert find_menu_item("baklavaa") is not None   # close typo -> Baklava
-    assert find_menu_item("zinger burger") is None  # not on the menu
+    assert find_menu_item("baklavaa") is not None
+    assert find_menu_item("zinger burger") is None
     assert find_menu_item("") is None
 
 

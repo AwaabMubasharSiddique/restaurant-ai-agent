@@ -1,16 +1,3 @@
-"""Reservation availability via simple per-slot counting (v1).
-
-The model is deliberately coarse: a day is divided into fixed time slots
-(RESERVATION_SLOT_MINUTES apart, between OPENING_TIME and CLOSING_TIME), and each
-slot can hold up to MAX_RESERVATIONS_PER_SLOT reservations. We just COUNT the
-active reservations sitting in a slot and compare to that cap — we are not
-tracking individual tables, table sizes, or how long a party stays.
-
-Where this extends later (see README): replace the integer cap with a set of
-real tables (capacity, joinable, indoor/outdoor), turn "count < cap" into a
-bin-packing/assignment check against party_size, and model seating duration so a
-7:00 booking still blocks part of 8:00.
-"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -18,7 +5,7 @@ from datetime import datetime, timedelta
 from config import settings
 from tools.store import select
 
-# A reservation in one of these states occupies a seat for counting purposes.
+
 _ACTIVE_STATUSES = {"pending", "confirmed"}
 
 
@@ -32,7 +19,6 @@ def _to_hhmm(total_minutes: int) -> str:
 
 
 def operating_slots() -> list[str]:
-    """All bookable slot start-times for a day, e.g. 11:00, 11:30, ... 21:30."""
     start = _to_minutes(settings.opening_time)
     end = _to_minutes(settings.closing_time)
     step = settings.reservation_slot_minutes
@@ -40,21 +26,11 @@ def operating_slots() -> list[str]:
 
 
 def is_within_hours(time_str: str) -> bool:
-    """True if a (valid) HH:MM time falls inside [opening, closing).
-
-    Raises ValueError on a malformed time so callers can ask for clarification
-    instead of silently snapping a nonsense time into the open window.
-    """
     minutes = _to_minutes(time_str)
     return _to_minutes(settings.opening_time) <= minutes < _to_minutes(settings.closing_time)
 
 
 def snap_to_slot(time_str: str) -> str:
-    """Round an arbitrary time to the nearest valid slot, clamped to opening hours.
-
-    Callers should check is_within_hours() first; the clamp here is just a
-    safety net so we never produce an out-of-range slot.
-    """
     step = settings.reservation_slot_minutes
     start = _to_minutes(settings.opening_time)
     end = _to_minutes(settings.closing_time)
@@ -64,8 +40,57 @@ def snap_to_slot(time_str: str) -> str:
     return _to_hhmm(snapped)
 
 
+def tables() -> list[dict]:
+    return settings.restaurant_tables
+
+
+def max_table_seats() -> int:
+    return max((int(t["seats"]) for t in tables()), default=0)
+
+
+def _occupied_table_ids(
+    date_str: str, time_str: str, exclude_id: str | None = None
+) -> set[str]:
+    duration = settings.seating_duration_minutes
+    requested = _to_minutes(time_str)
+    busy: set[str] = set()
+    for row in select("reservations", filters={"date": date_str}, order_by=None):
+        if row.get("status", "pending") not in _ACTIVE_STATUSES:
+            continue
+        if exclude_id is not None and row.get("id") == exclude_id:
+            continue
+        table_id = row.get("table_id")
+        booked_time = row.get("time")
+        if not table_id or not booked_time:
+            continue
+        try:
+            if abs(_to_minutes(booked_time) - requested) < duration:
+                busy.add(table_id)
+        except (ValueError, AttributeError):
+            continue
+    return busy
+
+
+def find_table(
+    date_str: str, time_str: str, party_size: int, exclude_id: str | None = None
+) -> str | None:
+    busy = _occupied_table_ids(date_str, time_str, exclude_id)
+    fits = [
+        t
+        for t in tables()
+        if int(t["seats"]) >= party_size and t["id"] not in busy
+    ]
+    fits.sort(key=lambda t: (int(t["seats"]), str(t["id"])))
+    return str(fits[0]["id"]) if fits else None
+
+
+def is_available(
+    date_str: str, time_str: str, party_size: int, exclude_id: str | None = None
+) -> bool:
+    return find_table(date_str, time_str, party_size, exclude_id) is not None
+
+
 def slot_count(date_str: str, time_str: str) -> int:
-    """How many active reservations already sit in this date+time slot."""
     rows = select(
         "reservations",
         filters={"date": date_str, "time": time_str},
@@ -74,25 +99,24 @@ def slot_count(date_str: str, time_str: str) -> int:
     return sum(1 for r in rows if r.get("status", "pending") in _ACTIVE_STATUSES)
 
 
-def is_available(date_str: str, time_str: str) -> bool:
-    """True if the slot is under capacity."""
-    return slot_count(date_str, time_str) < settings.max_reservations_per_slot
-
-
-def nearby_open_slots(date_str: str, time_str: str, limit: int = 3) -> list[str]:
-    """Return open slots on the same day, closest in time to the requested one."""
+def nearby_open_slots(
+    date_str: str,
+    time_str: str,
+    party_size: int,
+    limit: int = 3,
+    exclude_id: str | None = None,
+) -> list[str]:
     requested = _to_minutes(snap_to_slot(time_str))
     candidates = [
         slot
         for slot in operating_slots()
-        if slot != time_str and is_available(date_str, slot)
+        if slot != time_str and is_available(date_str, slot, party_size, exclude_id)
     ]
     candidates.sort(key=lambda s: abs(_to_minutes(s) - requested))
     return candidates[:limit]
 
 
 def format_time_12h(hhmm: str) -> str:
-    """'19:00' -> '7:00 PM' (cross-platform, no %-I)."""
     hour, minute = (int(p) for p in hhmm.split(":"))
     suffix = "AM" if hour < 12 else "PM"
     display_hour = hour % 12 or 12
@@ -100,16 +124,11 @@ def format_time_12h(hhmm: str) -> str:
 
 
 def within_edit_window(created_at_iso: str, window_minutes: int) -> bool:
-    """True if an ISO-8601 timestamp is within the last `window_minutes`.
-
-    Lets a customer self-reschedule a reservation shortly after creating it;
-    after the window, changes are handed to staff.
-    """
     if not created_at_iso:
         return False
     try:
         created = datetime.fromisoformat(created_at_iso)
     except (ValueError, TypeError):
         return False
-    now = datetime.now(created.tzinfo)  # match the timestamp's tz-awareness
+    now = datetime.now(created.tzinfo)
     return (now - created) <= timedelta(minutes=window_minutes)
