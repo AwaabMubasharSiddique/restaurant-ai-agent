@@ -18,13 +18,14 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-# The six categories the classifier must pick from.
+# The categories the classifier must pick from.
 Intent = Literal[
     "reservation",
     "menu_question",
     "order",
     "hours_location",
     "complaint",
+    "greeting",
     "other",
 ]
 

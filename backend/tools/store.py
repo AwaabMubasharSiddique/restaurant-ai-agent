@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
+from uuid import uuid4
 
 from config import settings
 
@@ -49,8 +50,23 @@ def insert(table: str, row: dict[str, Any]) -> dict[str, Any]:
         result = client.table(table).insert(row).execute()
         return result.data[0] if result.data else row
 
+    row.setdefault("id", str(uuid4()))  # Supabase generates its own; memory needs one
     _MEMORY[table].append(row)
     return row
+
+
+def update(table: str, row_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+    """Update the row identified by `id` and return the updated row."""
+    client = get_supabase()
+    if client is not None:
+        result = client.table(table).update(dict(changes)).eq("id", row_id).execute()
+        return result.data[0] if result.data else {"id": row_id, **dict(changes)}
+
+    for row in _MEMORY[table]:
+        if row.get("id") == row_id:
+            row.update(changes)
+            return row
+    return {"id": row_id, **dict(changes)}
 
 
 def select(

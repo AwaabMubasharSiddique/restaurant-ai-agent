@@ -13,6 +13,8 @@ bin-packing/assignment check against party_size, and model seating duration so a
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from config import settings
 from tools.store import select
 
@@ -95,3 +97,19 @@ def format_time_12h(hhmm: str) -> str:
     suffix = "AM" if hour < 12 else "PM"
     display_hour = hour % 12 or 12
     return f"{display_hour}:{minute:02d} {suffix}"
+
+
+def within_edit_window(created_at_iso: str, window_minutes: int) -> bool:
+    """True if an ISO-8601 timestamp is within the last `window_minutes`.
+
+    Lets a customer self-reschedule a reservation shortly after creating it;
+    after the window, changes are handed to staff.
+    """
+    if not created_at_iso:
+        return False
+    try:
+        created = datetime.fromisoformat(created_at_iso)
+    except (ValueError, TypeError):
+        return False
+    now = datetime.now(created.tzinfo)  # match the timestamp's tz-awareness
+    return (now - created) <= timedelta(minutes=window_minutes)

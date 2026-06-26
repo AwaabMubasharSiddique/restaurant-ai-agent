@@ -40,6 +40,7 @@ def build_graph():
     graph.add_node("handle_order", nodes.handle_order)
     graph.add_node("handle_hours_location", nodes.handle_hours_location)
     graph.add_node("handle_complaint", nodes.handle_complaint)
+    graph.add_node("handle_greeting", nodes.handle_greeting)
     graph.add_node("handle_other", nodes.handle_other)
     graph.add_node("persist_log", nodes.persist_log)
 

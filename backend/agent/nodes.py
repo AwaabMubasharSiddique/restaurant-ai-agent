@@ -15,11 +15,13 @@ from agent.llm import get_chat_model
 from agent.prompts import (
     COMPLAINT_SYSTEM_PROMPT,
     FIELD_PROMPTS,
+    GREETING_SYSTEM_PROMPT,
     HANDOFF_MESSAGE,
     HOURS_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     MENU_SYSTEM_PROMPT,
     ORDER_SYSTEM_PROMPT,
+    RESCHEDULE_SYSTEM_PROMPT,
     RESERVATION_SYSTEM_PROMPT,
 )
 from agent.state import AgentState
@@ -39,10 +41,11 @@ from tools.availability import (
     is_within_hours,
     nearby_open_slots,
     snap_to_slot,
+    within_edit_window,
 )
 from tools.logging_tool import log_conversation
 from tools.order import save_order
-from tools.reservation import save_reservation
+from tools.reservation import save_reservation, update_reservation
 
 logger = logging.getLogger("restaurant-ai.agent")
 
@@ -53,6 +56,7 @@ INTENT_TO_NODE = {
     "order": "handle_order",
     "hours_location": "handle_hours_location",
     "complaint": "handle_complaint",
+    "greeting": "handle_greeting",
     "other": "handle_other",
 }
 HANDLER_NODES = list(dict.fromkeys(INTENT_TO_NODE.values()))
@@ -98,7 +102,8 @@ def route_intent(state: AgentState) -> str:
 # 2. Handlers
 # ---------------------------------------------------------------------------
 def handle_menu_question(state: AgentState) -> dict:
-    context = retrieve(state["user_message"])
+    # Pull more chunks for menu questions so "show me the menu" gets the full list.
+    context = retrieve(state["user_message"], k=settings.menu_retrieval_k)
     llm = get_chat_model(temperature=0.2)
     reply = llm.invoke(
         [
@@ -141,6 +146,20 @@ def handle_complaint(state: AgentState) -> dict:
     return {"response": reply.content, "needs_human": True}
 
 
+def handle_greeting(state: AgentState) -> dict:
+    """Greetings, thanks, goodbyes — reply warmly, do NOT escalate to a human."""
+    llm = get_chat_model(temperature=0.5)
+    reply = llm.invoke(
+        [
+            SystemMessage(
+                content=GREETING_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
+            ),
+            HumanMessage(content=state["user_message"]),
+        ]
+    )
+    return {"response": reply.content, "needs_human": False}
+
+
 def handle_order(state: AgentState) -> dict:
     llm = get_chat_model(temperature=0).with_structured_output(OrderExtraction)
     history = _format_history(state.get("messages", []))
@@ -177,6 +196,21 @@ def handle_order(state: AgentState) -> dict:
 
 
 def handle_reservation(state: AgentState) -> dict:
+    # A request was already saved this session -> reschedule flow (self-service
+    # within the edit window, otherwise hand the change to staff). Never silently
+    # save a duplicate row.
+    if state.get("reservation_submitted"):
+        record = state.get("reservation_record")
+        if record and record.get("id"):
+            return _handle_reschedule(state, record)
+        return {
+            "response": (
+                "You already have a pending request — I've flagged your change for "
+                "our team, who'll adjust it when they confirm. What would you like to change?"
+            ),
+            "needs_human": True,
+        }
+
     llm = get_chat_model(temperature=0).with_structured_output(ReservationExtraction)
     history = _format_history(state.get("messages", []))
     today = datetime.now().strftime("%A, %Y-%m-%d")
@@ -247,7 +281,11 @@ def handle_reservation(state: AgentState) -> dict:
     # Large groups are coordinated by staff directly (a set menu may apply), so
     # we capture the request as pending and hand it to a person.
     if reservation.party_size >= settings.large_party_threshold:
-        save_reservation(reservation)
+        saved = save_reservation(reservation)
+        summary = (
+            f"{reservation.party_size} on {reservation.date} "
+            f"at {format_time_12h(reservation.time)}"
+        )
         return {
             "response": (
                 f"Thanks, {reservation.name}! For a group of {reservation.party_size} "
@@ -257,12 +295,16 @@ def handle_reservation(state: AgentState) -> dict:
                 f"{reservation.phone}."
             ),
             "needs_human": True,
+            "reservation_submitted": True,
+            "reservation_summary": summary,
+            "reservation_record": saved,
         }
 
     # Availability check BEFORE we offer anything (simple per-slot counting).
     if is_available(reservation.date, reservation.time):
-        save_reservation(reservation)
+        saved = save_reservation(reservation)
         pretty_time = format_time_12h(reservation.time)
+        summary = f"{reservation.party_size} on {reservation.date} at {pretty_time}"
         return {
             "response": (
                 f"Thank you, {reservation.name}! I've put in a reservation request "
@@ -271,6 +313,9 @@ def handle_reservation(state: AgentState) -> dict:
                 f"and we'll reach you at {reservation.phone}. \U0001f33f"
             ),
             "needs_human": False,
+            "reservation_submitted": True,
+            "reservation_summary": summary,
+            "reservation_record": saved,
         }
 
     # Slot is full: offer the nearest open slots and let the customer choose.
@@ -290,6 +335,130 @@ def handle_reservation(state: AgentState) -> dict:
             f"Would another day work? I'm happy to check availability."
         ),
         "needs_human": False,
+    }
+
+
+def _handle_reschedule(state: AgentState, record: dict) -> dict:
+    """Change an already-submitted reservation in place if still within the edit
+    window; otherwise hand the change to staff. (Reservations only — not orders.)"""
+    window = settings.reservation_edit_window_minutes
+    old_summary = state.get("reservation_summary", "your reservation")
+
+    if not within_edit_window(record.get("created_at", ""), window):
+        return {
+            "response": (
+                f"Your request for {old_summary} has been in for over {window} minutes, "
+                "so our team will make any changes when they confirm — I've flagged your "
+                "note. What would you like changed?"
+            ),
+            "needs_human": True,
+        }
+
+    llm = get_chat_model(temperature=0).with_structured_output(ReservationExtraction)
+    history = _format_history(state.get("messages", []))
+    today = datetime.now().strftime("%A, %Y-%m-%d")
+    extraction: ReservationExtraction = llm.invoke(
+        [
+            SystemMessage(
+                content=RESCHEDULE_SYSTEM_PROMPT.format(
+                    today=today,
+                    name=record["name"],
+                    date=record["date"],
+                    time=record["time"],
+                    party_size=record["party_size"],
+                    phone=record["phone"],
+                )
+            ),
+            HumanMessage(
+                content=f"Conversation:\n{history}\n\nLatest message: {state['user_message']}"
+            ),
+        ]
+    )
+
+    # Keep current values for anything the customer didn't change.
+    try:
+        new_time_raw = extraction.time or record["time"]
+        if not is_within_hours(new_time_raw):
+            return {
+                "response": (
+                    f"We're open from {format_time_12h(settings.opening_time)} to "
+                    f"{format_time_12h(settings.closing_time)}. What time should I change it to?"
+                ),
+                "needs_human": False,
+            }
+        revised = Reservation(
+            name=extraction.name or record["name"],
+            date=extraction.date or record["date"],
+            time=snap_to_slot(new_time_raw),
+            party_size=extraction.party_size or record["party_size"],
+            phone=extraction.phone or record["phone"],
+        )
+    except (ValueError, ValidationError):
+        return {
+            "response": "Sure — what new date and time would you like? (e.g. June 28 at 7:00 PM)",
+            "needs_human": False,
+        }
+
+    if datetime.strptime(revised.date, "%Y-%m-%d").date() < datetime.now().date():
+        return {
+            "response": (
+                f"That date ({revised.date}) has already passed — "
+                "what upcoming date would you like?"
+            ),
+            "needs_human": False,
+        }
+
+    # Nothing actually changed yet -> ask what they want to change.
+    if (
+        revised.date == record["date"]
+        and revised.time == record["time"]
+        and revised.party_size == record["party_size"]
+        and revised.phone == record["phone"]
+        and revised.name == record["name"]
+    ):
+        return {
+            "response": "Of course — what would you like to change (time, date, or party size)?",
+            "needs_human": False,
+        }
+
+    # If the slot moved, make sure the new one isn't full.
+    slot_moved = revised.date != record["date"] or revised.time != record["time"]
+    if slot_moved and not is_available(revised.date, revised.time):
+        alternatives = nearby_open_slots(revised.date, revised.time)
+        if alternatives:
+            pretty = ", ".join(format_time_12h(s) for s in alternatives)
+            return {
+                "response": (
+                    f"That new time on {revised.date} is fully reserved, but we have "
+                    f"openings at {pretty}. Want one of those?"
+                ),
+                "needs_human": False,
+            }
+        return {
+            "response": f"We're fully reserved on {revised.date}. Would another day work?",
+            "needs_human": False,
+        }
+
+    # Apply the change to the SAME row (keep id / status / created_at).
+    changes = {
+        "name": revised.name,
+        "date": revised.date,
+        "time": revised.time,
+        "party_size": revised.party_size,
+        "phone": revised.phone,
+    }
+    update_reservation(record["id"], changes)
+    new_record = {**record, **changes}
+    new_summary = f"{revised.party_size} on {revised.date} at {format_time_12h(revised.time)}"
+    return {
+        "response": (
+            f"All set, {revised.name} — I've updated your reservation to {new_summary}. "
+            "It's still pending and our team will confirm shortly."
+        ),
+        "needs_human": revised.party_size >= settings.large_party_threshold,
+        "reservation_submitted": True,
+        "reservation_record": new_record,
+        "reservation_summary": new_summary,
     }
 
 

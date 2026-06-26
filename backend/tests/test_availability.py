@@ -66,3 +66,14 @@ def test_format_time_12h():
     assert availability.format_time_12h("00:30") == "12:30 AM"
     assert availability.format_time_12h("12:00") == "12:00 PM"
     assert availability.format_time_12h("11:00") == "11:00 AM"
+
+
+def test_within_edit_window():
+    from datetime import datetime, timedelta, timezone
+
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
+    assert availability.within_edit_window(recent, 30) is True
+    assert availability.within_edit_window(old, 30) is False
+    assert availability.within_edit_window("", 30) is False          # no timestamp
+    assert availability.within_edit_window("not-a-date", 30) is False  # malformed

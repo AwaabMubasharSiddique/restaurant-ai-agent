@@ -26,3 +26,8 @@ class AgentState(TypedDict, total=False):
     confidence: float  # set by classify_intent
     response: str  # set by the chosen handler
     needs_human: bool  # set by the chosen handler
+
+    # Reservation-flow memory (persisted per session by the checkpointer)
+    reservation_submitted: bool  # True once a request has been saved this session
+    reservation_summary: str  # human-readable summary of that saved request
+    reservation_record: dict  # the saved row (id, created_at, date, time, ...)

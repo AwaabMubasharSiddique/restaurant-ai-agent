@@ -33,11 +33,16 @@ class Settings(BaseSettings):
     closing_time: str = "22:00"  # HH:MM, 24h
     # Parties this size or larger are handed to staff (set menu may apply).
     large_party_threshold: int = 8
+    # Customers can self-reschedule a reservation within this many minutes of
+    # creating it; after that, changes are handed to staff.
+    reservation_edit_window_minutes: int = 30
 
     # --- RAG ---
     data_path: str = "data/restaurant_info.txt"
     faiss_index_path: str = "rag/faiss_index"
     retrieval_k: int = 4
+    # Broader pull for "show me the menu" so the whole list lands in context.
+    menu_retrieval_k: int = 10
 
     # --- Agent ---
     low_confidence_threshold: float = 0.6
