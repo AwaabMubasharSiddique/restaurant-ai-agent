@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 from datetime import datetime, timedelta
 
@@ -55,6 +56,14 @@ from tools.reservation import (
 
 logger = logging.getLogger("restaurant-ai.agent")
 
+# The conversation-so-far for the current turn. Set once at classify_intent (the
+# first node) and read by compose() so every phrased reply is aware of context —
+# what was already asked, that we've already greeted, the dish referenced earlier.
+# Each /chat request runs its whole graph in one thread, so this stays isolated.
+_turn_history: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "turn_history", default=""
+)
+
 
 INTENT_TO_NODE = {
     "reservation": "handle_reservation",
@@ -86,6 +95,9 @@ def compose(
     human = f"Situation: {situation}"
     if facts:
         human += f"\n\nFacts (use exactly, don't alter):\n{facts}"
+    history = _turn_history.get()
+    if history:
+        human = f"Conversation so far:\n{history}\n\n{human}"
     return safe_text(
         [SystemMessage(content=COMPOSE_SYSTEM_PROMPT), HumanMessage(content=human)],
         temperature=temperature,
@@ -160,11 +172,16 @@ def route_intent(state: AgentState) -> str:
 
 def handle_menu_question(state: AgentState) -> dict:
     context = retrieve(state["user_message"], k=settings.menu_retrieval_k)
+    history = _format_history(state.get("messages", []))
     reply = safe_text(
         [
             SystemMessage(content=MENU_SYSTEM_PROMPT),
             HumanMessage(
-                content=f"Menu & info:\n{context}\n\nCustomer question: {state['user_message']}"
+                content=(
+                    f"Conversation so far:\n{history}\n\n"
+                    f"Menu & info:\n{context}\n\n"
+                    f"Customer's latest question: {state['user_message']}"
+                )
             ),
         ],
         temperature=0.6,
@@ -178,11 +195,16 @@ def handle_menu_question(state: AgentState) -> dict:
 
 def handle_hours_location(state: AgentState) -> dict:
     context = retrieve(state["user_message"])
+    history = _format_history(state.get("messages", []))
     reply = safe_text(
         [
             SystemMessage(content=HOURS_SYSTEM_PROMPT),
             HumanMessage(
-                content=f"Info:\n{context}\n\nCustomer question: {state['user_message']}"
+                content=(
+                    f"Conversation so far:\n{history}\n\n"
+                    f"Info:\n{context}\n\n"
+                    f"Customer's latest question: {state['user_message']}"
+                )
             ),
         ],
         temperature=0.6,
@@ -195,10 +217,16 @@ def handle_hours_location(state: AgentState) -> dict:
 
 
 def handle_complaint(state: AgentState) -> dict:
+    history = _format_history(state.get("messages", []))
     reply = safe_text(
         [
             SystemMessage(content=COMPLAINT_SYSTEM_PROMPT),
-            HumanMessage(content=state["user_message"]),
+            HumanMessage(
+                content=(
+                    f"Conversation so far:\n{history}\n\n"
+                    f"Customer's latest message: {state['user_message']}"
+                )
+            ),
         ],
         temperature=0.6,
         fallback=(
@@ -210,10 +238,16 @@ def handle_complaint(state: AgentState) -> dict:
 
 
 def handle_greeting(state: AgentState) -> dict:
+    history = _format_history(state.get("messages", []))
     reply = safe_text(
         [
             SystemMessage(content=GREETING_SYSTEM_PROMPT),
-            HumanMessage(content=state["user_message"]),
+            HumanMessage(
+                content=(
+                    f"Conversation so far:\n{history}\n\n"
+                    f"Customer's latest message: {state['user_message']}"
+                )
+            ),
         ],
         temperature=0.85,
         fallback=(
@@ -229,6 +263,7 @@ def handle_order(state: AgentState) -> dict:
     pending_summary = ", ".join(f"{i['quantity']}× {i['name']}" for i in pending) or "none"
 
     history = _format_history(state.get("messages", []))
+    _turn_history.set(history)
     turn = safe_structured(
         [
             SystemMessage(
@@ -364,6 +399,7 @@ def handle_order(state: AgentState) -> dict:
 
 
 def handle_reservation(state: AgentState) -> dict:
+    _turn_history.set(_format_history(state.get("messages", [])))
     if state.get("reservation_submitted"):
         record = state.get("reservation_record")
         if record and record.get("id"):
@@ -713,10 +749,17 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
 
 
 def handle_other(state: AgentState) -> dict:
+    history = _format_history(state.get("messages", []))
+    _turn_history.set(history)
     triage = safe_structured(
         [
             SystemMessage(content=OFF_TOPIC_TRIAGE_PROMPT),
-            HumanMessage(content=state["user_message"]),
+            HumanMessage(
+                content=(
+                    f"Conversation so far:\n{history}\n\n"
+                    f"Latest message to triage: {state['user_message']}"
+                )
+            ),
         ],
         OffTopicTriage,
         fallback=OffTopicTriage(forward_to_team=False),
@@ -756,6 +799,13 @@ def _ask_for_missing(missing: list[str]) -> str:
 
 def persist_log(state: AgentState) -> dict:
     response = state.get("response", "")
+    logger.info(
+        "turn session=%s intent=%s confidence=%.2f needs_human=%s",
+        state.get("session_id", "?"),
+        state.get("intent", "other"),
+        state.get("confidence", 0.0),
+        state.get("needs_human", False),
+    )
     log = ConversationLog(
         conversation_id=state["session_id"],
         customer_message=state["user_message"],

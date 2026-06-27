@@ -107,5 +107,33 @@ def test_off_topic_forwards_real_request(echo_llm):
 
 def test_off_topic_trivia_no_handoff(echo_llm):
     echo_llm[OffTopicTriage] = OffTopicTriage(forward_to_team=False)
-    out = nodes.handle_other({"user_message": "capital of pakistan?"})
+    out = nodes.handle_other({"user_message": "capital of pakistan?", "messages": []})
     assert out["needs_human"] is False
+
+
+def test_conversation_history_reaches_compose(monkeypatch):
+    """The phrased reply (via compose) must see the prior turns, not just the
+    latest message — otherwise the assistant has no memory of the conversation."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    captured = {}
+
+    def capture_text(messages, **kw):
+        captured["human"] = messages[-1].content
+        return "ok"
+
+    monkeypatch.setattr(nodes, "safe_text", capture_text)
+    monkeypatch.setattr(nodes, "safe_structured", lambda m, s, *, fallback: fallback)
+
+    state = {
+        "user_message": "and a vegan one?",
+        "messages": [
+            HumanMessage(content="hi"),
+            AIMessage(content="welcome to the olive branch!"),
+            HumanMessage(content="and a vegan one?"),
+        ],
+    }
+    nodes.handle_other(state)
+
+    assert "Conversation so far" in captured["human"]
+    assert "welcome to the olive branch!" in captured["human"]
