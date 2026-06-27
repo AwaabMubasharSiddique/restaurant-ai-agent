@@ -44,27 +44,38 @@ _BY_NAME = {item["name"].lower(): item for item in MENU}
 
 
 def find_menu_item(name: str) -> dict | None:
+    return match_menu_item(name)[0]
+
+
+def match_menu_item(name: str) -> tuple[dict | None, bool]:
+    """Return (item, was_fuzzy). ``was_fuzzy`` is True when the match came from a
+    near-miss rather than an exact name, so callers can confirm it with the guest."""
     key = (name or "").strip().lower()
     if not key:
-        return None
+        return None, False
     if key in _BY_NAME:
-        return _BY_NAME[key]
+        return _BY_NAME[key], False
     close = difflib.get_close_matches(key, _BY_NAME.keys(), n=1, cutoff=0.82)
-    return _BY_NAME[close[0]] if close else None
+    return (_BY_NAME[close[0]], True) if close else (None, False)
 
 
-def price_items(items: list) -> tuple[list, list]:
+def price_items(items: list) -> tuple[list, list, list]:
+    """Returns (priced, unknown, corrections). ``corrections`` holds
+    (what_they_said, matched_name) pairs for fuzzy matches worth confirming."""
     priced: list[dict] = []
     unknown: list[str] = []
+    corrections: list[tuple[str, str]] = []
     for item in items:
-        found = find_menu_item(item.name)
+        found, was_fuzzy = match_menu_item(item.name)
         if found:
             priced.append(
                 {"name": found["name"], "quantity": item.quantity, "price": found["price"]}
             )
+            if was_fuzzy:
+                corrections.append((item.name, found["name"]))
         else:
             unknown.append(item.name)
-    return priced, unknown
+    return priced, unknown, corrections
 
 
 def order_total(priced: list) -> float:

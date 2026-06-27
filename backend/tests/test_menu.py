@@ -14,7 +14,7 @@ def test_find_menu_item_fuzzy_and_miss():
 
 
 def test_price_items_splits_known_and_unknown():
-    priced, unknown = price_items(
+    priced, unknown, corrections = price_items(
         [OrderItem(name="Baklava", quantity=2), OrderItem(name="Zinger Burger", quantity=1)]
     )
     assert len(priced) == 1
@@ -22,6 +22,13 @@ def test_price_items_splits_known_and_unknown():
     assert priced[0]["price"] == 7.00
     assert priced[0]["quantity"] == 2
     assert unknown == ["Zinger Burger"]
+    assert corrections == []
+
+
+def test_price_items_reports_fuzzy_corrections():
+    priced, unknown, corrections = price_items([OrderItem(name="baklavaa", quantity=1)])
+    assert priced[0]["name"] == "Baklava"
+    assert corrections == [("baklavaa", "Baklava")]
 
 
 def test_order_total():

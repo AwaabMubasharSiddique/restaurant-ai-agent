@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
+const MAX_LEN = 1000
+
 export default function ChatInput({ onSend, disabled }) {
   const [value, setValue] = useState('')
   const inputRef = useRef(null)
@@ -23,6 +25,7 @@ export default function ChatInput({ onSend, disabled }) {
         type="text"
         placeholder="Ask about reservations, the menu, hours…"
         value={value}
+        maxLength={MAX_LEN}
         onChange={(e) => setValue(e.target.value)}
         disabled={disabled}
         autoFocus

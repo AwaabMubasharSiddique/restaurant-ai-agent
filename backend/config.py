@@ -15,8 +15,23 @@ class Settings(BaseSettings):
     openai_chat_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 
+    llm_timeout_seconds: float = 20.0
+    llm_max_retries: int = 2
+
     supabase_url: str | None = None
     supabase_key: str | None = None
+
+    # IANA name driving every "now"/"today"/edit-window calculation and stored
+    # timestamps, so booking logic and the DB agree regardless of server locale.
+    timezone: str = "UTC"
+
+    # Optional shared secret; when set, /chat requires a matching X-API-Key header.
+    api_key: str = ""
+
+    # Cap on conversation turns kept per session so state can't grow unbounded.
+    max_history_messages: int = 24
+
+    checkpoint_db_path: str = "data/checkpoints.sqlite"
 
     restaurant_tables: list[dict] = [
         {"id": "T1", "seats": 4},

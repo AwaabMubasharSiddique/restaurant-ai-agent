@@ -39,9 +39,9 @@ def build_graph():
 compiled_graph = build_graph()
 
 
-def run_agent(message: str, session_id: str) -> dict:
+async def run_agent(message: str, session_id: str) -> dict:
     config = {"configurable": {"thread_id": session_id}}
-    return compiled_graph.invoke(
+    return await compiled_graph.ainvoke(
         {
             "messages": [HumanMessage(content=message)],
             "user_message": message,

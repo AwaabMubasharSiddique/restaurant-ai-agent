@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import logging
+import threading
 from collections import defaultdict
-from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
+from clock import now_iso
 from config import settings
 
 try:
-    from supabase import Client, create_client
+    from supabase import create_client
 except ImportError:
-    Client = None
     create_client = None
 
+logger = logging.getLogger("restaurant-ai.store")
 
 _MEMORY: dict[str, list[dict]] = defaultdict(list)
+_MEMORY_LOCK = threading.RLock()
 
 
 @lru_cache(maxsize=1)
@@ -26,7 +29,7 @@ def get_supabase():
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_iso()
 
 
 def insert(table: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -35,24 +38,37 @@ def insert(table: str, row: dict[str, Any]) -> dict[str, Any]:
 
     client = get_supabase()
     if client is not None:
-        result = client.table(table).insert(row).execute()
-        return result.data[0] if result.data else row
+        try:
+            result = client.table(table).insert(row).execute()
+            if result.data:
+                return result.data[0]
+            logger.error("Supabase insert into %s returned no rows", table)
+        except Exception:
+            logger.exception("Supabase insert into %s failed; falling back to memory", table)
+        # fall through to the in-memory path so the turn still completes
 
     row.setdefault("id", str(uuid4()))
-    _MEMORY[table].append(row)
+    with _MEMORY_LOCK:
+        _MEMORY[table].append(row)
     return row
 
 
 def update(table: str, row_id: str, changes: dict[str, Any]) -> dict[str, Any]:
     client = get_supabase()
     if client is not None:
-        result = client.table(table).update(dict(changes)).eq("id", row_id).execute()
-        return result.data[0] if result.data else {"id": row_id, **dict(changes)}
+        try:
+            result = client.table(table).update(dict(changes)).eq("id", row_id).execute()
+            if result.data:
+                return result.data[0]
+            logger.error("Supabase update of %s id=%s matched no rows", table, row_id)
+        except Exception:
+            logger.exception("Supabase update of %s failed; falling back to memory", table)
 
-    for row in _MEMORY[table]:
-        if row.get("id") == row_id:
-            row.update(changes)
-            return row
+    with _MEMORY_LOCK:
+        for row in _MEMORY[table]:
+            if row.get("id") == row_id:
+                row.update(changes)
+                return dict(row)
     return {"id": row_id, **dict(changes)}
 
 
@@ -64,16 +80,21 @@ def select(
 ) -> list[dict[str, Any]]:
     client = get_supabase()
     if client is not None:
-        query = client.table(table).select("*")
-        for key, value in (filters or {}).items():
-            query = query.eq(key, value)
-        if order_by:
-            query = query.order(order_by, desc=descending)
-        return query.execute().data or []
+        try:
+            query = client.table(table).select("*")
+            for key, value in (filters or {}).items():
+                query = query.eq(key, value)
+            if order_by:
+                query = query.order(order_by, desc=descending)
+            return query.execute().data or []
+        except Exception:
+            logger.exception("Supabase select from %s failed; falling back to memory", table)
 
-    rows = list(_MEMORY[table])
+    with _MEMORY_LOCK:
+        rows = [dict(r) for r in _MEMORY[table]]
     if filters:
         rows = [r for r in rows if all(r.get(k) == v for k, v in filters.items())]
     if order_by:
-        rows.sort(key=lambda r: r.get(order_by, ""), reverse=descending)
+        # Coerce to str so mixed/missing sort keys never raise on comparison.
+        rows.sort(key=lambda r: str(r.get(order_by) or ""), reverse=descending)
     return rows

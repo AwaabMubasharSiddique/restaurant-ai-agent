@@ -6,24 +6,27 @@ from datetime import datetime, timedelta
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import ValidationError
 
-from agent.llm import get_chat_model
+from agent.llm import safe_structured, safe_text
 from agent.prompts import (
     COMPLAINT_SYSTEM_PROMPT,
+    COMPOSE_SYSTEM_PROMPT,
     FIELD_PROMPTS,
     GREETING_SYSTEM_PROMPT,
     HOURS_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     MENU_SYSTEM_PROMPT,
-    OFF_TOPIC_SYSTEM_PROMPT,
+    OFF_TOPIC_TRIAGE_PROMPT,
     ORDER_SYSTEM_PROMPT,
     RESCHEDULE_SYSTEM_PROMPT,
     RESERVATION_SYSTEM_PROMPT,
 )
 from agent.state import AgentState
+from clock import now, today
 from config import settings
 from models.schemas import (
     ConversationLog,
     IntentResult,
+    OffTopicTriage,
     Order,
     OrderItem,
     OrderTurn,
@@ -34,10 +37,8 @@ from models.schemas import (
 from menu import format_menu_for_prompt, order_total, price_items
 from rag.retriever import retrieve
 from tools.availability import (
-    find_table,
+    fits_within_hours,
     format_time_12h,
-    is_available,
-    is_within_hours,
     max_table_seats,
     nearby_open_slots,
     snap_to_slot,
@@ -45,7 +46,12 @@ from tools.availability import (
 )
 from tools.logging_tool import log_conversation
 from tools.order import save_order
-from tools.reservation import cancel_reservation, save_reservation, update_reservation
+from tools.reservation import (
+    cancel_reservation,
+    reserve_table,
+    save_reservation,
+    update_reservation_if_free,
+)
 
 logger = logging.getLogger("restaurant-ai.agent")
 
@@ -60,6 +66,31 @@ INTENT_TO_NODE = {
     "other": "handle_other",
 }
 HANDLER_NODES = list(dict.fromkeys(INTENT_TO_NODE.values()))
+
+
+_GLITCH_FALLBACK = "Sorry — I glitched for a second there. Mind trying that again?"
+
+
+def compose(
+    situation: str,
+    facts: str = "",
+    *,
+    fallback: str | None = None,
+    temperature: float = 0.75,
+) -> str:
+    """Phrase a reply from a situation + locked facts. The model varies wording;
+    the facts must come through verbatim. Never raises — on any LLM failure it
+    returns ``fallback`` (or a generic line), so a turn that has already written
+    to the DB still completes and commits its state instead of erroring and
+    inviting a duplicate-booking retry."""
+    human = f"Situation: {situation}"
+    if facts:
+        human += f"\n\nFacts (use exactly, don't alter):\n{facts}"
+    return safe_text(
+        [SystemMessage(content=COMPOSE_SYSTEM_PROMPT), HumanMessage(content=human)],
+        temperature=temperature,
+        fallback=fallback or _GLITCH_FALLBACK,
+    )
 
 
 def _format_history(messages: list, limit: int = 12) -> str:
@@ -77,17 +108,22 @@ def _bill_lines(priced: list) -> str:
 
 
 def _check_reservation_date(date_str: str) -> str | None:
-    requested = datetime.strptime(date_str, "%Y-%m-%d").date()
-    today = datetime.now().date()
-    if requested < today:
-        return (
-            f"It looks like {date_str} has already passed — "
-            "what upcoming date would you like to come in?"
+    try:
+        requested = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    today_ = today()
+    if requested < today_:
+        return compose(
+            "The date the customer asked for has already gone by; gently ask what "
+            "upcoming date they'd like to come in instead.",
+            f"date they gave: {date_str} (already in the past)",
         )
-    if requested > today + timedelta(days=settings.max_advance_days):
-        return (
-            f"We take reservations up to about a month ahead. Could you pick a date "
-            f"within the next {settings.max_advance_days} days?"
+    if requested > today_ + timedelta(days=settings.max_advance_days):
+        return compose(
+            "The customer asked for a date too far out; ask them to pick one within "
+            "our booking window.",
+            f"how far ahead we book: about {settings.max_advance_days} days",
         )
     return None
 
@@ -99,9 +135,8 @@ def _natural_join(phrases: list[str]) -> str:
 
 
 def classify_intent(state: AgentState) -> dict:
-    llm = get_chat_model(temperature=0).with_structured_output(IntentResult)
     history = _format_history(state.get("messages", []))
-    result: IntentResult = llm.invoke(
+    result = safe_structured(
         [
             SystemMessage(content=INTENT_SYSTEM_PROMPT),
             HumanMessage(
@@ -110,7 +145,9 @@ def classify_intent(state: AgentState) -> dict:
                     f"Classify the latest customer message: {state['user_message']}"
                 )
             ),
-        ]
+        ],
+        IntentResult,
+        fallback=IntentResult(intent="other", confidence=0.0),
     )
     return {"intent": result.intent, "confidence": result.confidence}
 
@@ -123,68 +160,76 @@ def route_intent(state: AgentState) -> str:
 
 def handle_menu_question(state: AgentState) -> dict:
     context = retrieve(state["user_message"], k=settings.menu_retrieval_k)
-    llm = get_chat_model(temperature=0.2)
-    reply = llm.invoke(
+    reply = safe_text(
         [
-            SystemMessage(
-                content=MENU_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
-            ),
+            SystemMessage(content=MENU_SYSTEM_PROMPT),
             HumanMessage(
                 content=f"Menu & info:\n{context}\n\nCustomer question: {state['user_message']}"
             ),
-        ]
+        ],
+        temperature=0.6,
+        fallback=(
+            "I'm having a brief hiccup pulling up the menu — could you ask again in a "
+            "moment? I can also help with hours or a reservation."
+        ),
     )
-    return {"response": reply.content, "needs_human": False}
+    return {"response": reply, "needs_human": False}
 
 
 def handle_hours_location(state: AgentState) -> dict:
     context = retrieve(state["user_message"])
-    llm = get_chat_model(temperature=0.2)
-    reply = llm.invoke(
+    reply = safe_text(
         [
-            SystemMessage(
-                content=HOURS_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
-            ),
+            SystemMessage(content=HOURS_SYSTEM_PROMPT),
             HumanMessage(
                 content=f"Info:\n{context}\n\nCustomer question: {state['user_message']}"
             ),
-        ]
+        ],
+        temperature=0.6,
+        fallback=(
+            "I'm having trouble looking that up this second — mind asking again in a "
+            "moment?"
+        ),
     )
-    return {"response": reply.content, "needs_human": False}
+    return {"response": reply, "needs_human": False}
 
 
 def handle_complaint(state: AgentState) -> dict:
-    llm = get_chat_model(temperature=0.4)
-    reply = llm.invoke(
+    reply = safe_text(
         [
             SystemMessage(content=COMPLAINT_SYSTEM_PROMPT),
             HumanMessage(content=state["user_message"]),
-        ]
+        ],
+        temperature=0.6,
+        fallback=(
+            "I'm really sorry about that. I've flagged this for a team member who'll "
+            "follow up with you personally."
+        ),
     )
-
-    return {"response": reply.content, "needs_human": True}
+    return {"response": reply, "needs_human": True}
 
 
 def handle_greeting(state: AgentState) -> dict:
-    llm = get_chat_model(temperature=0.5)
-    reply = llm.invoke(
+    reply = safe_text(
         [
-            SystemMessage(
-                content=GREETING_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
-            ),
+            SystemMessage(content=GREETING_SYSTEM_PROMPT),
             HumanMessage(content=state["user_message"]),
-        ]
+        ],
+        temperature=0.85,
+        fallback=(
+            f"Welcome to {settings.restaurant_name}! How can I help — the menu, hours, "
+            "a reservation, or an order?"
+        ),
     )
-    return {"response": reply.content, "needs_human": False}
+    return {"response": reply, "needs_human": False}
 
 
 def handle_order(state: AgentState) -> dict:
     pending = state.get("pending_order") or []
     pending_summary = ", ".join(f"{i['quantity']}× {i['name']}" for i in pending) or "none"
 
-    llm = get_chat_model(temperature=0).with_structured_output(OrderTurn)
     history = _format_history(state.get("messages", []))
-    turn: OrderTurn = llm.invoke(
+    turn = safe_structured(
         [
             SystemMessage(
                 content=ORDER_SYSTEM_PROMPT.format(
@@ -194,24 +239,31 @@ def handle_order(state: AgentState) -> dict:
             HumanMessage(
                 content=f"Conversation:\n{history}\n\nLatest message: {state['user_message']}"
             ),
-        ]
+        ],
+        OrderTurn,
+        fallback=OrderTurn(),
     )
 
     if turn.cancel and pending:
         return {
-            "response": "No problem — I've cleared that order. Anything else?",
+            "response": compose(
+                "The customer asked to scrap the order they were building; confirm it's "
+                "cleared and check whether there's anything else you can get them."
+            ),
             "needs_human": False,
             "pending_order": [],
         }
 
+    corrections: list[tuple[str, str]] = []
     if turn.items:
-        priced, unknown = price_items(turn.items)
+        priced, unknown, corrections = price_items(turn.items)
         if not priced:
             missing = ", ".join(unknown) if unknown else "those"
             return {
-                "response": (
-                    f"I couldn't find {missing} on our menu, so I can't add that. "
-                    "Want me to list what we have?"
+                "response": compose(
+                    "The customer named items that aren't on our menu, so nothing could "
+                    "be added; offer to list what we do have.",
+                    f"items we couldn't find: {missing}",
                 ),
                 "needs_human": False,
             }
@@ -223,13 +275,16 @@ def handle_order(state: AgentState) -> dict:
     if not priced:
         if turn.confirm:
             return {
-                "response": "I don't have an order started yet — what would you like to order?",
+                "response": compose(
+                    "The customer tried to place an order, but nothing's been started "
+                    "yet; ask what they'd like."
+                ),
                 "needs_human": False,
             }
         return {
-            "response": (
-                "I'd love to take your order! What would you like? "
-                "You can ask to see the menu too."
+            "response": compose(
+                "The customer is in ordering mode but hasn't named anything yet; invite "
+                "them to order, and mention they can ask to see the menu."
             ),
             "needs_human": False,
         }
@@ -239,6 +294,9 @@ def handle_order(state: AgentState) -> dict:
         if unknown
         else ""
     )
+    if corrections:
+        reads = "; ".join(f'"{said}" as {matched}' for said, matched in corrections)
+        unknown_note += f"\n\n(I read {reads} — let me know if that's not right.)"
     bill = f"{_bill_lines(priced)}\nTotal: ${order_total(priced):.2f}"
 
     missing_contact = []
@@ -251,9 +309,10 @@ def handle_order(state: AgentState) -> dict:
 
     if missing_contact:
         return {
-            "response": (
-                f"Here's your order:\n{bill}{unknown_note}\n\n"
-                f"To place it for delivery, could you share {_natural_join(missing_contact)}?"
+            "response": compose(
+                "You've totaled the customer's in-progress order. Read it back to them, "
+                "then ask for the delivery details still missing so you can place it.",
+                f"order:\n{bill}{unknown_note}\n\nstill need: {_natural_join(missing_contact)}",
             ),
             "needs_human": False,
             "pending_order": priced,
@@ -274,21 +333,30 @@ def handle_order(state: AgentState) -> dict:
             )
         )
         return {
-            "response": (
-                f"Order placed! ✅\n{_bill_lines(priced)}\n"
-                f"Total: ${total:.2f}\n"
-                f"Delivering to {turn.address}, under {turn.name} ({turn.phone}). "
-                "It's pending — the kitchen will confirm shortly. Payment on delivery."
+            "response": compose(
+                "The customer just confirmed and the order is now placed. Give them a "
+                "quick, upbeat recap, and make clear it's pending until the kitchen "
+                "confirms and that payment is on delivery.",
+                f"order placed:\n{_bill_lines(priced)}\nTotal: ${total:.2f}\n"
+                f"delivering to: {turn.address}\nunder name: {turn.name}\n"
+                f"phone: {turn.phone}\nstatus: pending kitchen confirmation; payment on delivery",
+                fallback=(
+                    f"Order placed! ✅\n{_bill_lines(priced)}\nTotal: ${total:.2f}\n"
+                    f"Delivering to {turn.address}, under {turn.name} ({turn.phone}). "
+                    "It's pending until the kitchen confirms — payment on delivery."
+                ),
             ),
             "needs_human": False,
             "pending_order": [],
         }
 
     return {
-        "response": (
-            f"Here's your order:\n{bill}{unknown_note}\n\n"
-            f"Delivering to {turn.address}, under {turn.name} ({turn.phone}). "
-            "Shall I place it? (pending until the kitchen confirms; payment on delivery)"
+        "response": compose(
+            "The customer's order and all delivery details are in; read it back and ask "
+            "if you should place it. Note it stays pending until the kitchen confirms and "
+            "payment is on delivery.",
+            f"order:\n{bill}{unknown_note}\ndelivering to: {turn.address}\n"
+            f"under name: {turn.name}\nphone: {turn.phone}",
         ),
         "needs_human": False,
         "pending_order": priced,
@@ -301,27 +369,29 @@ def handle_reservation(state: AgentState) -> dict:
         if record and record.get("id"):
             return _handle_reservation_followup(state, record)
         return {
-            "response": (
-                "You already have a pending request — I've flagged your change for "
-                "our team, who'll adjust it when they confirm. What would you like to change?"
+            "response": compose(
+                "The customer already has a pending reservation request on file; let them "
+                "know the team will handle any change when they confirm, and ask what "
+                "they'd like to change."
             ),
             "needs_human": True,
         }
 
-    llm = get_chat_model(temperature=0).with_structured_output(ReservationExtraction)
     history = _format_history(state.get("messages", []))
-    today = datetime.now().strftime("%A, %Y-%m-%d")
+    today_str = now().strftime("%A, %Y-%m-%d")
 
-    extraction: ReservationExtraction = llm.invoke(
+    extraction = safe_structured(
         [
-            SystemMessage(content=RESERVATION_SYSTEM_PROMPT.format(today=today)),
+            SystemMessage(content=RESERVATION_SYSTEM_PROMPT.format(today=today_str)),
             HumanMessage(
                 content=(
                     f"Conversation:\n{history}\n\n"
                     f"Latest customer message: {state['user_message']}"
                 )
             ),
-        ]
+        ],
+        ReservationExtraction,
+        fallback=ReservationExtraction(),
     )
 
     required = {
@@ -336,13 +406,14 @@ def handle_reservation(state: AgentState) -> dict:
         return {"response": _ask_for_missing(missing), "needs_human": False}
 
     try:
-        requested_date = datetime.strptime(extraction.date, "%Y-%m-%d").date()
-        if not is_within_hours(extraction.time):
+        if not fits_within_hours(extraction.time):
             return {
-                "response": (
-                    f"We're open from {format_time_12h(settings.opening_time)} to "
-                    f"{format_time_12h(settings.closing_time)}. "
-                    f"What time in that window would you like?"
+                "response": compose(
+                    "The time the customer wants doesn't leave a full seating before we "
+                    "close; share the hours and ask for an earlier time.",
+                    f"open from {format_time_12h(settings.opening_time)} to "
+                    f"{format_time_12h(settings.closing_time)}; a seating runs "
+                    f"{settings.seating_duration_minutes} minutes",
                 ),
                 "needs_human": False,
             }
@@ -356,9 +427,10 @@ def handle_reservation(state: AgentState) -> dict:
         )
     except (ValueError, ValidationError):
         return {
-            "response": (
-                "I just want to get the details right — could you share the date "
-                "as a calendar date (e.g. June 28) and a time (e.g. 7:00 PM)?"
+            "response": compose(
+                "You couldn't make sense of the date/time the customer gave; ask them to "
+                "restate it as a normal calendar date and clock time.",
+                "example to suggest: June 28 at 7:00 PM",
             ),
             "needs_human": False,
         }
@@ -367,19 +439,25 @@ def handle_reservation(state: AgentState) -> dict:
     if date_problem:
         return {"response": date_problem, "needs_human": False}
 
+    pretty_time = format_time_12h(reservation.time)
+    summary = f"{reservation.party_size} on {reservation.date} at {pretty_time}"
+
     if reservation.party_size > max_table_seats():
         saved = save_reservation(reservation)
-        summary = (
-            f"{reservation.party_size} on {reservation.date} "
-            f"at {format_time_12h(reservation.time)}"
-        )
         return {
-            "response": (
-                f"Thanks, {reservation.name}! A group of {reservation.party_size} is "
-                f"larger than any single table, so I've logged your request for "
-                f"{reservation.date} at {format_time_12h(reservation.time)} as pending and "
-                f"a team member will reach out personally to arrange the seating. "
-                f"We'll contact you at {reservation.phone}."
+            "response": compose(
+                "The party is bigger than any single table, so you've logged the request "
+                "as pending and a team member will personally arrange the seating. "
+                "Reassure them.",
+                f"name: {reservation.name}\nparty size: {reservation.party_size}\n"
+                f"date: {reservation.date}\ntime: {pretty_time}\n"
+                f"we'll contact them at: {reservation.phone}\nstatus: pending",
+                fallback=(
+                    f"Thanks, {reservation.name}! A party of {reservation.party_size} is "
+                    f"larger than any single table, so I've logged your request for "
+                    f"{summary} as pending — a team member will arrange the seating and "
+                    f"reach you at {reservation.phone}."
+                ),
             ),
             "needs_human": True,
             "reservation_submitted": True,
@@ -387,18 +465,20 @@ def handle_reservation(state: AgentState) -> dict:
             "reservation_record": saved,
         }
 
-    table_id = find_table(reservation.date, reservation.time, reservation.party_size)
-    if table_id:
-        reservation.table_id = table_id
-        saved = save_reservation(reservation)
-        pretty_time = format_time_12h(reservation.time)
-        summary = f"{reservation.party_size} on {reservation.date} at {pretty_time}"
+    saved = reserve_table(reservation)
+    if saved is not None:
         return {
-            "response": (
-                f"Thank you, {reservation.name}! I've put in a reservation request "
-                f"for {reservation.party_size} on {reservation.date} at {pretty_time}. "
-                f"It's marked as pending — our team will review and confirm shortly, "
-                f"and we'll reach you at {reservation.phone}. \U0001f33f"
+            "response": compose(
+                "You've put in the customer's reservation request; thank them and recap "
+                "it. It's pending until the team reviews and confirms.",
+                f"name: {reservation.name}\nparty size: {reservation.party_size}\n"
+                f"date: {reservation.date}\ntime: {pretty_time}\n"
+                f"we'll reach them at: {reservation.phone}\nstatus: pending confirmation",
+                fallback=(
+                    f"Thank you, {reservation.name}! I've put in your reservation request "
+                    f"for {summary}. It's pending — our team will confirm shortly and "
+                    f"reach you at {reservation.phone}."
+                ),
             ),
             "needs_human": False,
             "reservation_submitted": True,
@@ -412,17 +492,19 @@ def handle_reservation(state: AgentState) -> dict:
     if alternatives:
         pretty = ", ".join(format_time_12h(s) for s in alternatives)
         return {
-            "response": (
-                f"That time on {reservation.date} is fully booked for a party of "
-                f"{reservation.party_size}, but we have openings at {pretty}. "
-                f"Would any of those work for you?"
+            "response": compose(
+                "The requested time is fully booked for that party size, but other times "
+                "that day are open; offer them and ask if any work.",
+                f"date: {reservation.date}\nparty size: {reservation.party_size}\n"
+                f"open times: {pretty}",
             ),
             "needs_human": False,
         }
     return {
-        "response": (
-            f"I'm so sorry — we're fully booked for a party of {reservation.party_size} "
-            f"on {reservation.date}. Would another day work? I'm happy to check."
+        "response": compose(
+            "That whole day is fully booked for the customer's party size; apologize and "
+            "offer to check another day.",
+            f"date: {reservation.date}\nparty size: {reservation.party_size}",
         ),
         "needs_human": False,
     }
@@ -433,14 +515,13 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
     old_summary = state.get("reservation_summary", "your reservation")
     within = within_edit_window(record.get("created_at", ""), window)
 
-    llm = get_chat_model(temperature=0).with_structured_output(RescheduleResult)
     history = _format_history(state.get("messages", []))
-    today = datetime.now().strftime("%A, %Y-%m-%d")
-    result: RescheduleResult = llm.invoke(
+    today_str = now().strftime("%A, %Y-%m-%d")
+    result = safe_structured(
         [
             SystemMessage(
                 content=RESCHEDULE_SYSTEM_PROMPT.format(
-                    today=today,
+                    today=today_str,
                     name=record["name"],
                     date=record["date"],
                     time=record["time"],
@@ -451,15 +532,19 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             HumanMessage(
                 content=f"Conversation:\n{history}\n\nLatest message: {state['user_message']}"
             ),
-        ]
+        ],
+        RescheduleResult,
+        fallback=RescheduleResult(action="status"),
     )
 
     if result.action == "status":
         return {
-            "response": (
-                f"Your reservation is for {record['party_size']} on {record['date']} "
-                f"at {format_time_12h(record['time'])}, under {record['name']}. "
-                "It's still pending — our team will confirm shortly."
+            "response": compose(
+                "The customer is asking about their existing reservation; tell them what's "
+                "on file and that it's still pending team confirmation.",
+                f"name: {record['name']}\nparty size: {record['party_size']}\n"
+                f"date: {record['date']}\ntime: {format_time_12h(record['time'])}\n"
+                f"status: pending",
             ),
             "needs_human": False,
         }
@@ -468,9 +553,14 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
         if within:
             cancel_reservation(record["id"])
             return {
-                "response": (
-                    f"Done — I've cancelled your reservation for {old_summary}. "
-                    "We hope to welcome you another time!"
+                "response": compose(
+                    "You've cancelled the customer's reservation as they asked; confirm "
+                    "it's done and that you'd love to see them another time.",
+                    f"cancelled reservation: {old_summary}",
+                    fallback=(
+                        f"Done — I've cancelled your reservation for {old_summary}. "
+                        "We hope to welcome you another time!"
+                    ),
                 ),
                 "needs_human": False,
                 "reservation_submitted": False,
@@ -478,30 +568,35 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
                 "reservation_summary": "",
             }
         return {
-            "response": (
-                f"I've passed your request to cancel {old_summary} to our team — "
-                "they'll take care of it when they review. Sorry we'll miss you!"
+            "response": compose(
+                "The customer wants to cancel, but it's past the self-serve window, so "
+                "you've passed it to the team to handle on review. Sorry to see them go.",
+                f"reservation to cancel: {old_summary}",
             ),
             "needs_human": True,
         }
 
     if not within:
         return {
-            "response": (
-                f"Your request for {old_summary} has been in for over {window} minutes, "
-                "so our team will make any changes when they confirm — I've flagged your "
-                "note. What would you like changed?"
+            "response": compose(
+                "The customer wants to change a reservation that's past the self-serve "
+                "edit window; let them know the team will apply changes on confirmation, "
+                "and ask what they'd like changed.",
+                f"reservation: {old_summary}\nedit window: {window} minutes",
             ),
             "needs_human": True,
         }
 
     try:
         new_time_raw = result.time or record["time"]
-        if not is_within_hours(new_time_raw):
+        if not fits_within_hours(new_time_raw):
             return {
-                "response": (
-                    f"We're open from {format_time_12h(settings.opening_time)} to "
-                    f"{format_time_12h(settings.closing_time)}. What time should I change it to?"
+                "response": compose(
+                    "The new time doesn't leave a full seating before we close; share the "
+                    "hours and ask for an earlier time.",
+                    f"open from {format_time_12h(settings.opening_time)} to "
+                    f"{format_time_12h(settings.closing_time)}; a seating runs "
+                    f"{settings.seating_duration_minutes} minutes",
                 ),
                 "needs_human": False,
             }
@@ -514,7 +609,11 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
         )
     except (ValueError, ValidationError):
         return {
-            "response": "Sure — what new date and time would you like? (e.g. June 28 at 7:00 PM)",
+            "response": compose(
+                "You couldn't parse the new date/time for the change; ask them to restate "
+                "it as a calendar date and clock time.",
+                "example to suggest: June 28 at 7:00 PM",
+            ),
             "needs_human": False,
         }
 
@@ -530,7 +629,10 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
         and revised.name == record["name"]
     ):
         return {
-            "response": "Of course — what would you like to change (time, date, or party size)?",
+            "response": compose(
+                "The customer wants to change the reservation but hasn't said what; ask "
+                "what they'd like to change — time, date, or party size."
+            ),
             "needs_human": False,
         }
 
@@ -540,53 +642,53 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
         or revised.time != record["time"]
         or revised.party_size != record["party_size"]
     )
-    new_table_id = record.get("table_id")
-    if too_big:
-        new_table_id = None
-    elif needs_reseat:
-        new_table_id = find_table(
+    new_summary = f"{revised.party_size} on {revised.date} at {format_time_12h(revised.time)}"
+
+    changes = update_reservation_if_free(
+        record["id"],
+        revised,
+        current_table_id=record.get("table_id"),
+        needs_reseat=needs_reseat,
+        too_big=too_big,
+    )
+    if changes is None:
+        alternatives = nearby_open_slots(
             revised.date, revised.time, revised.party_size, exclude_id=record["id"]
         )
-        if not new_table_id:
-            alternatives = nearby_open_slots(
-                revised.date, revised.time, revised.party_size, exclude_id=record["id"]
-            )
-            if alternatives:
-                pretty = ", ".join(format_time_12h(s) for s in alternatives)
-                return {
-                    "response": (
-                        f"That change leaves no free table on {revised.date} at "
-                        f"{format_time_12h(revised.time)} for a party of "
-                        f"{revised.party_size}, but we have openings at {pretty}. "
-                        f"Want one of those?"
-                    ),
-                    "needs_human": False,
-                }
+        if alternatives:
+            pretty = ", ".join(format_time_12h(s) for s in alternatives)
             return {
-                "response": (
-                    f"We're fully booked on {revised.date} for a party of "
-                    f"{revised.party_size}. Would another day work?"
+                "response": compose(
+                    "The requested change leaves no free table at that time, but other "
+                    "times that day are open; offer them and ask if one works.",
+                    f"date: {revised.date}\ntime: {format_time_12h(revised.time)}\n"
+                    f"party size: {revised.party_size}\nopen times: {pretty}",
                 ),
                 "needs_human": False,
             }
+        return {
+            "response": compose(
+                "The requested change can't be fit — that day is fully booked for the "
+                "new party size; offer another day.",
+                f"date: {revised.date}\nparty size: {revised.party_size}",
+            ),
+            "needs_human": False,
+        }
 
-    changes = {
-        "name": revised.name,
-        "date": revised.date,
-        "time": revised.time,
-        "party_size": revised.party_size,
-        "phone": revised.phone,
-        "table_id": new_table_id,
-    }
-    update_reservation(record["id"], changes)
     new_record = {**record, **changes}
-    new_summary = f"{revised.party_size} on {revised.date} at {format_time_12h(revised.time)}"
     if too_big:
         return {
-            "response": (
-                f"Thanks, {revised.name} — a group of {revised.party_size} is larger than "
-                f"any single table, so I've updated your request to {new_summary} and our "
-                f"team will arrange the seating personally. It's still pending."
+            "response": compose(
+                "You've updated the reservation, but the new party is larger than any "
+                "single table, so the team will arrange seating personally. It's still "
+                "pending.",
+                f"name: {revised.name}\nparty size: {revised.party_size}\n"
+                f"updated to: {new_summary}\nstatus: pending",
+                fallback=(
+                    f"Thanks, {revised.name} — I've updated your request to {new_summary}. "
+                    f"A party that size needs the team to arrange seating, so it stays "
+                    f"pending."
+                ),
             ),
             "needs_human": True,
             "reservation_submitted": True,
@@ -594,9 +696,14 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
             "reservation_summary": new_summary,
         }
     return {
-        "response": (
-            f"All set, {revised.name} — I've updated your reservation to {new_summary}. "
-            "It's still pending and our team will confirm shortly."
+        "response": compose(
+            "You've updated the customer's reservation; confirm the new details and that "
+            "it's still pending team confirmation.",
+            f"name: {revised.name}\nupdated to: {new_summary}\nstatus: pending",
+            fallback=(
+                f"All set, {revised.name} — I've updated your reservation to {new_summary}. "
+                f"It's still pending and our team will confirm shortly."
+            ),
         ),
         "needs_human": False,
         "reservation_submitted": True,
@@ -606,25 +713,45 @@ def _handle_reservation_followup(state: AgentState, record: dict) -> dict:
 
 
 def handle_other(state: AgentState) -> dict:
-    llm = get_chat_model(temperature=0.3)
-    reply = llm.invoke(
+    triage = safe_structured(
         [
-            SystemMessage(
-                content=OFF_TOPIC_SYSTEM_PROMPT.format(restaurant=settings.restaurant_name)
-            ),
+            SystemMessage(content=OFF_TOPIC_TRIAGE_PROMPT),
             HumanMessage(content=state["user_message"]),
-        ]
+        ],
+        OffTopicTriage,
+        fallback=OffTopicTriage(forward_to_team=False),
     )
-    return {"response": reply.content, "needs_human": False}
+
+    if triage.forward_to_team:
+        return {
+            "response": compose(
+                "The customer asked for something outside what you handle, but it sounds "
+                "like a real request our team should follow up on. Let them know you've "
+                "passed it along and someone will get back to them, then mention you can "
+                "help directly with the menu, hours, reservations, or an order.",
+                f"their message: {state['user_message']}",
+            ),
+            "needs_human": True,
+        }
+
+    return {
+        "response": compose(
+            "The customer's message is off-topic and not something the restaurant deals "
+            "with at all. Lightly let them know it's outside what you can help with, "
+            "without answering it, and steer them toward what you can do — the menu, "
+            "hours & location, reservations, and orders."
+        ),
+        "needs_human": False,
+    }
 
 
 def _ask_for_missing(missing: list[str]) -> str:
-    phrases = [FIELD_PROMPTS[field] for field in missing]
-    if len(phrases) == 1:
-        ask = phrases[0]
-    else:
-        ask = ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
-    return f"I'd be glad to help set that up! Could you share {ask}?"
+    needed = _natural_join([FIELD_PROMPTS[field] for field in missing])
+    return compose(
+        "You're setting up a reservation and still need a few details from the customer; "
+        "ask for them warmly.",
+        f"still need: {needed}",
+    )
 
 
 def persist_log(state: AgentState) -> dict:

@@ -101,6 +101,18 @@ class OrderTurn(BaseModel):
     cancel: bool = False
 
 
+class OffTopicTriage(BaseModel):
+    forward_to_team: bool = Field(
+        description=(
+            "True if this is a genuine request our staff should follow up on but the "
+            "assistant can't handle automatically (catering, private events, a lost item, "
+            "hiring, partnerships, an unusual special request). False for pure off-topic "
+            "noise the restaurant has nothing to do with (general trivia, coding help, "
+            "jokes, world facts)."
+        )
+    )
+
+
 class RescheduleResult(BaseModel):
     action: Literal["status", "change", "cancel"] = "change"
     name: Optional[str] = None

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
+from clock import now as _now
 from config import settings
 from tools.store import select
 
@@ -18,11 +19,19 @@ def _to_hhmm(total_minutes: int) -> str:
     return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
+def _last_start_minutes() -> int:
+    """Latest start whose full seating still ends by closing, aligned to the grid."""
+    start = _to_minutes(settings.opening_time)
+    step = settings.reservation_slot_minutes
+    limit = _to_minutes(settings.closing_time) - settings.seating_duration_minutes
+    steps = max(0, (limit - start) // step)
+    return start + steps * step
+
+
 def operating_slots() -> list[str]:
     start = _to_minutes(settings.opening_time)
-    end = _to_minutes(settings.closing_time)
     step = settings.reservation_slot_minutes
-    return [_to_hhmm(m) for m in range(start, end, step)]
+    return [_to_hhmm(m) for m in range(start, _last_start_minutes() + 1, step)]
 
 
 def is_within_hours(time_str: str) -> bool:
@@ -30,13 +39,24 @@ def is_within_hours(time_str: str) -> bool:
     return _to_minutes(settings.opening_time) <= minutes < _to_minutes(settings.closing_time)
 
 
+def fits_within_hours(time_str: str) -> bool:
+    """True if a booking at this time both opens after opening and finishes its full
+    seating before closing (no overrun past close)."""
+    try:
+        minutes = _to_minutes(time_str)
+    except (ValueError, AttributeError):
+        return False
+    start = _to_minutes(settings.opening_time)
+    end = _to_minutes(settings.closing_time)
+    return start <= minutes and minutes + settings.seating_duration_minutes <= end
+
+
 def snap_to_slot(time_str: str) -> str:
     step = settings.reservation_slot_minutes
     start = _to_minutes(settings.opening_time)
-    end = _to_minutes(settings.closing_time)
     minutes = _to_minutes(time_str)
     snapped = round((minutes - start) / step) * step + start
-    snapped = max(start, min(snapped, end - step))
+    snapped = max(start, min(snapped, _last_start_minutes()))
     return _to_hhmm(snapped)
 
 
@@ -130,5 +150,6 @@ def within_edit_window(created_at_iso: str, window_minutes: int) -> bool:
         created = datetime.fromisoformat(created_at_iso)
     except (ValueError, TypeError):
         return False
-    now = datetime.now(created.tzinfo)
-    return (now - created) <= timedelta(minutes=window_minutes)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return (_now() - created) <= timedelta(minutes=window_minutes)
