@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import ChatWindow from './components/ChatWindow.jsx'
 import { ApiError, sendMessage } from './api.js'
 
+// Bump this when the stored shape changes so old/incoherent transcripts are dropped.
+const TRANSCRIPT_KEY = 'transcript_v2'
+
 function genId() {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -25,8 +28,13 @@ const GREETING = {
 
 function loadMessages() {
   try {
-    const saved = JSON.parse(localStorage.getItem('transcript') || 'null')
-    if (Array.isArray(saved) && saved.length) return saved
+    const saved = JSON.parse(localStorage.getItem(TRANSCRIPT_KEY) || 'null')
+    if (Array.isArray(saved) && saved.length) {
+      // Drop a trailing user message that never got a reply (e.g. a refresh
+      // mid-send), so we never restore an orphaned message with no response.
+      const trimmed = saved[saved.length - 1]?.role === 'user' ? saved.slice(0, -1) : saved
+      return trimmed.length ? trimmed : [GREETING]
+    }
   } catch {
     /* ignore corrupt transcript */
   }
@@ -53,19 +61,18 @@ export default function App() {
   const [awaitingHuman, setAwaitingHuman] = useState(false)
   const sessionId = useRef(loadSessionId())
 
-  // Persist the transcript (minus transient error bubbles) so a reload keeps context.
+  // Persist the transcript faithfully so a reload restores a coherent conversation
+  // (a failed turn keeps its error reply + Retry button rather than leaving an
+  // orphaned user message). Errors self-clear on the next send.
   useEffect(() => {
-    localStorage.setItem(
-      'transcript',
-      JSON.stringify(messages.filter((m) => !m.error)),
-    )
+    localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(messages))
   }, [messages])
 
   function startNewConversation() {
     const id = genId()
     sessionId.current = id
     localStorage.setItem('session_id', id)
-    localStorage.removeItem('transcript')
+    localStorage.removeItem(TRANSCRIPT_KEY)
     setMessages([GREETING])
     setAwaitingHuman(false)
     setConnected(true)
