@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -82,7 +83,9 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     session_id = _valid_session_id(body.session_id)
 
     try:
-        result = await run_agent(body.message, session_id)
+        # run_agent is blocking (sync graph + durable SqliteSaver); offload it so
+        # the event loop stays free while a worker thread does the LLM work.
+        result = await run_in_threadpool(run_agent, body.message, session_id)
     except Exception:
         logger.exception("Agent run failed for session %s", session_id)
         raise HTTPException(

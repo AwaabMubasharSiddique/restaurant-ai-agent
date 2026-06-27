@@ -13,7 +13,7 @@ from config import settings  # noqa: E402
 
 @pytest.fixture
 def client(monkeypatch):
-    async def fake_run_agent(message, session_id):
+    def fake_run_agent(message, session_id):
         return {"response": f"echo: {message}", "intent": "greeting", "needs_human": False}
 
     monkeypatch.setattr(main, "run_agent", fake_run_agent)
@@ -64,8 +64,25 @@ def test_chat_requires_api_key_when_set(client, monkeypatch):
 
 
 def test_chat_503_on_agent_failure(client, monkeypatch):
-    async def boom(message, session_id):
+    def boom(message, session_id):
         raise RuntimeError("down")
 
     monkeypatch.setattr(main, "run_agent", boom)
     assert client.post("/chat", json={"message": "hi"}).status_code == 503
+
+
+def test_chat_runs_real_graph_through_checkpointer(monkeypatch):
+    """End-to-end: endpoint -> threadpool -> real graph -> SqliteSaver -> nodes.
+    The LLM is stubbed at the node boundary; this guards the wiring between the
+    async route and the (sync) durable checkpointer."""
+    from agent import nodes
+
+    monkeypatch.setattr(nodes, "safe_text", lambda messages, **kw: kw.get("fallback", "hello"))
+    monkeypatch.setattr(nodes, "safe_structured", lambda messages, schema, *, fallback: fallback)
+    main.app.state.limiter.enabled = False
+
+    client = TestClient(main.app)
+    r = client.post("/chat", json={"message": "hello there"})
+    assert r.status_code == 200
+    assert r.json()["response"]
+    assert r.json()["session_id"]
